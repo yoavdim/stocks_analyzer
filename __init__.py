@@ -6,7 +6,7 @@ financial report fetching, and GUI-based visualization.
 """
 
 # Data fetching layer
-from .yfinance_info import YahooInfo, YahooGroup, yahoo_symbol_is_index, YfinanceException
+from .yfinance_info import YahooInfo, YahooGroup, YfinanceException
 from .reports import Reports, BaseReport, MsnReportsException
 from .yahoo_reports import YReports
 

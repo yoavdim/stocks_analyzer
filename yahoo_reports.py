@@ -59,11 +59,12 @@ class YReports(BaseReport):
     def pre_pickle(self):
         self.yf_ticker = None
 
-    def post_pickle(self, yf_ticker:yf.Ticker = None):
+    def post_pickle(self, yf_ticker = None):
         if yf_ticker is not None:
             self.yf_ticker = yf_ticker
         else:
-            self.yf_ticker = yf.Ticker(self.full_symbol)
+            from fx_converter import YfTickerUSD
+            self.yf_ticker = YfTickerUSD(self.full_symbol)
 
     def parse_and_save_reports(self):
         # todo finish

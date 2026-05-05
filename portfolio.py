@@ -532,6 +532,9 @@ class PortfolioGui(QWidget):
         with open(path, "w") as f:
             f.write("\n".join(rows) + "\n")
 
+        portfolio_name = os.path.splitext(os.path.basename(path))[0]
+        self.setWindowTitle(f"Portfolio Analyzer - {portfolio_name}")
+
     def _open_optimal(self):
         self._open_portfolio_from_weights(self._portfolio.tangency_portfolio, "Optimal Portfolio (Tangency)")
 
@@ -542,13 +545,13 @@ class PortfolioGui(QWidget):
         """Create and open a new portfolio from a dict of {full_symbol: weight}."""
         try:
             from pypfopt.discrete_allocation import DiscreteAllocation
-            from ticker import yahoo_symbol_is_index
+            from ticker import is_stock
 
             p = self._portfolio
             # Build full_symbol -> (symbol, market, price) mapping from the existing parallel lists
             full_to_info = {}
             for sym, mkt, fsym, price in zip(p.symbols, p.markets, p.full_symbols, p.current_prices):
-                if not yahoo_symbol_is_index(sym) and price and price > 0:
+                if is_stock(p.yf_ticker.tickers[fsym]) and price and price > 0:
                     full_to_info[fsym] = (sym, mkt, price)
 
             print(f"\n{title} Weights (before filtering):")

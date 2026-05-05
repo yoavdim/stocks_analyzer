@@ -7,7 +7,7 @@ from pypfopt import EfficientFrontier, plotting
 
 from reports import Reports
 from yahoo_reports import YReports
-from yfinance_info import YahooInfo, YahooGroup, yahoo_symbol_is_index
+from yfinance_info import YahooInfo, YahooGroup, is_stock
 import numpy as np
 import pandas as pd
 from numpy.polynomial.polynomial import Polynomial
@@ -67,9 +67,9 @@ class MarketDataCache:
 
     def get_market_monthly_returns(self) -> pd.Series:
         def fetch():
-            import yfinance as yf
-            market_hist = yf.Ticker("^GSPC").history(period="10y")["Close"].iloc[::30]
-            market_hist.index = market_hist.index.tz_localize(None)
+            from fx_converter import YfTickerUSD
+            market_ticker = YfTickerUSD("^GSPC")
+            market_hist = market_ticker.history(period="10y")["Close"].iloc[::30]
             return market_hist.pct_change().dropna()
         return self._get("mkt_monthly", fetch)
 

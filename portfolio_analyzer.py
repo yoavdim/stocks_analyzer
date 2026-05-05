@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 from matplotlib import pyplot as plt
+from fx_converter import fx_converter
 from yfinance_info import YahooInfo
 from ticker import TickerGroup, search_growth, Ticker, PORTFOLIO_CONFIG
 from portfolio import Portfolio, PortfolioGui
@@ -23,11 +24,33 @@ Ticker	Market	Date	Amount	Action	Cost
 sep  = "\t"
 comment = "#"
 frmt = "%Y-%m-%d"  # T%H:%M:%S"
+
+# Convert Cost to base currency using FX rate at transaction date
+market_to_currency = {
+    "NASDAQ": "USD", "NYSE": "USD", "AMEX": "USD",
+    "TLV": "ILA",  # Israeli stocks trade in agora
+    "TSE": "CAD",
+    "LON": "GBX",  # London trades in pence
+    "ASX": "AUD",
+    "TPE": "TWD", "TYO": "JPY", "SWX": "CHF",
+    "AMS": "EUR", "STO": "SEK", "KRX": "KRW", "SHE": "CNY",
+}
+
 def read_tsv(file):
     import io
     with open(file) as f:
         lines = [l for l in f if not l.lstrip().startswith('#') and l.strip()]
-    return pd.read_csv(io.StringIO("".join(lines)), sep=sep)
+    table = pd.read_csv(io.StringIO("".join(lines)), sep=sep)
+    if "Cost" in table.columns and "Market" in table.columns and "Date" in table.columns:
+        # Market -> price currency (what the cost is denominated in)
+        dates = pd.to_datetime(table["Date"], format=frmt)
+        for i, row in table.iterrows():
+            currency = market_to_currency.get(row["Market"], "USD")
+            if currency != fx_converter.base_currency:
+                rate = fx_converter.get_rate_at(currency, dates.iloc[i])
+                table.at[i, "Cost"] = row["Cost"] * rate
+
+    return table
 
 
 def get_buy_amount(df):
@@ -194,6 +217,8 @@ def main():
     else:
         gui = PortfolioGui(portfolio, run_portfolio_optimization)
     
+    portfolio_name = os.path.splitext(os.path.basename(file))[0]
+    gui.setWindowTitle(f"Portfolio Analyzer - {portfolio_name}")
     gui.show()
     sys.exit(app.exec_())
 

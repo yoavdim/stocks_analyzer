@@ -26,7 +26,8 @@
     "portfolio": {
         "use_past_growth": true,
         "forecast_growth_field": "irr[%]",
-        "use_shrinkage": true
+        "use_shrinkage": true,
+        "base_currency": "USD"
     },
     "tldr_fields": [
         "pe_ratio",

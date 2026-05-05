@@ -7,6 +7,7 @@ import pandas as pd
 import os
 import json
 from pypfopt.risk_models import fix_nonpositive_semidefinite, CovarianceShrinkage
+from fx_converter import YfTickerUSD, YfTickersUSD
 
 _config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "npv_config.json")
 with open(_config_path, "r") as _f:
@@ -57,28 +58,22 @@ def get_ticker_from_standard_symbols(symbol:str, market:str):
 
 class YahooInfo:
 
-    def translate_price(self, value):
-        """ In Israel, convert from agura to shekel, as in the reports """
-        if self.market_endian == "TA":
-            return value / 100
-        return value
-
     def get_stock_price_now(self):
-        """Get the current stock price, or, if the market is closed, the closing price,
+        """Get the current stock price in USD, or, if the market is closed, the closing price,
         without caching, as the price continue to change"""
         todays_data = self.yf_ticker.history(period='1d')
-        return self.translate_price(todays_data['Close'].iloc[0])
+        return todays_data['Close'].iloc[0]
 
     def get_stock_price_at_date(self, day, month, year):
-        """Get the stock price at the given date, or the closet after it if the
-        market was close in that date. @date is a dictionary of keys day, month
+        """Get the stock price in USD at the given date, or the closest after it if the
+        market was closed on that date. @date is a dictionary of keys day, month
         and year"""
 
         # Use zfill to make 6 appear as 06. This would make it compatible with
         # the format in the cache file
         date_str = "{year}-{month}-{day}".format(day=str(day).zfill(2), month=str(month).zfill(2), year=year)
         if date_str in self.stock_prices:
-            return self.translate_price(self.stock_prices[date_str])
+            return self.stock_prices[date_str]
 
         # We never fetched the stock for this date, we fetch the stock price
         # from a day *after* the requested one because yahoo data (for some
@@ -111,7 +106,7 @@ class YahooInfo:
 
         # return the first value in the table which is the closest stock price
         # to the requested date
-        return self.translate_price(stocks_data.iloc[0]["Close"])
+        return stocks_data.iloc[0]["Close"]
 
     def get_stock_price_in_range(self, from_date, to_date, interval="1d"):
         # in case any date isn't cached, fetch the entire date range and cache
@@ -123,17 +118,17 @@ class YahooInfo:
                                              interval=interval)
         times = stocks_data.index
         prices = stocks_data['Close']
-        return times, self.translate_price(prices)
+        return times, prices
 
     def pre_pickle(self):
         self.yf_ticker = None
 
     def post_pickle(self, yf_ticker=None):
-        self.yf_ticker = yf_ticker if yf_ticker else yf.Ticker(self.full_symbol)
+        self.yf_ticker = yf_ticker if yf_ticker else YfTickerUSD(self.full_symbol)
 
     def __init__(self, symbol, market, *, yf_info = None):
         self.full_symbol, self.market_endian = get_ticker_from_standard_symbols(symbol, market)
-        self.yf_ticker = yf_info if yf_info else yf.Ticker(self.full_symbol)
+        self.yf_ticker = yf_info if yf_info else YfTickerUSD(self.full_symbol)
         try:
             self.info = self.yf_ticker.info
             self.stock_prices = dict()
@@ -143,7 +138,7 @@ class YahooInfo:
 
 
 class YahooGroup:
-    """ Get prices synchronised. tested only with same currency """
+    """ Get prices synchronised, all converted to USD """
     def __init__(self, symbols: list, markets: list):
         self.symbols = symbols
         self.markets = markets
@@ -151,7 +146,7 @@ class YahooGroup:
         self.full_symbols = list()
         for i in range(len(symbols)):
             self.full_symbols.append(get_ticker_from_standard_symbols(symbols[i], markets[i])[0])
-        self.yf_ticker = yf.Tickers(" ".join(self.full_symbols))
+        self.yf_ticker = YfTickersUSD(yf.Tickers(" ".join(self.full_symbols)))
 
     def calculate_correlation(self):
         self.get_monthly_prices()
