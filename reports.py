@@ -143,9 +143,27 @@ class BaseReport:
         # self.parse_and_save_reports()
 
     def finish_init(self):
+        self._ffill_diluted_shares()
         self.get_ttm("balance_sheet")
         self.get_ttm("income_statement")
         self.get_ttm("cash_flow")
+
+    def _ffill_diluted_shares(self):
+        """Forward-fill 'Diluted Weighted Average Shares' across quarterly income statements."""
+        import numpy as np
+        quarterly = self.income_statement.get("quarterly", {})
+        if not quarterly:
+            return
+
+        last_valid = None
+        for key in sorted(quarterly.keys()):
+            report = quarterly[key]
+            shares = report.get("Diluted Weighted Average Shares")
+            if shares is not None and not np.isnan(shares):
+                last_valid = shares
+            elif last_valid is not None:
+                report["Diluted Weighted Average Shares"] = last_valid
+                print(f"Warning: {self.symbol} quarterly diluted shares missing, forward-filled")
 
     def parse_and_save_reports(self):
         """ fill the dictionaries """
