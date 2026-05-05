@@ -161,8 +161,21 @@ class GrowthApp(QWidget):
             "maximal_long_term_growth_rate": float(self.perpetuity_growth_input.text()) / 100 if self.perpetuity_group.checkedButton().text() == "Slow Exponent" else 0,
         }
         print(args_iir)
-        price_target, iir = self.ticker._calc_dcf_intrinsic_values(
-            discount_rate=float(self.discount_rate_input.text()) / 100, **args_iir)
+        discount_rate = float(self.discount_rate_input.text()) / 100
+        calc_npv, price = self.ticker._build_dcf_from_plot_data(
+            growth_rate=growth_rate,
+            short_term_is_linear=is_linear,
+            add_bv=args_iir["add_bv"],
+            long_term_growth_duration=args_iir["long_term_growth_duration"],
+            short_term_growth_duration=args_iir["short_term_growth_duration"],
+            maximal_long_term_growth_rate=args_iir["maximal_long_term_growth_rate"],
+        )
+        if calc_npv is None:
+            self.result_label.setText("Cannot compute: insufficient data")
+            return
+        from ticker import search_growth, NPV_ASSUMPTIONS
+        price_target = calc_npv(discount_rate)
+        iir = search_growth(calc_npv, price, min_growth=NPV_ASSUMPTIONS["irr_search_min"])
         print(iir)
         is_linear = self.trend_group.checkedButton().text() == "Linear"
         if is_linear:

@@ -143,11 +143,15 @@ class PortfolioBuilderDialog(QDialog):
         markets = [m for s, m, a in selected]
         amounts = [a for s, m, a in selected]
 
+        # Filter existing_tickers to only include selected symbols
+        selected_keys = set(zip(symbols, markets))
+        filtered_tickers = {k: v for k, v in self._existing_tickers.items() if k in selected_keys}
+
         try:
             from portfolio import Portfolio, PortfolioGui
             portfolio = Portfolio(
                 symbols, markets, amounts,
-                existing_tickers=self._existing_tickers,
+                existing_tickers=filtered_tickers,
                 use_past_growth=self._use_past_growth
             )
             portfolio.calculate_correlation()

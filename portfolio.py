@@ -9,10 +9,10 @@ from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as Navigatio
 from PyQt5.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton, QSplitter, QFileDialog
 from PyQt5.QtCore import Qt
 
-from ticker import Ticker, TickerGroup, market_data
+from ticker import Ticker, TickerGroup, FundamentalMixin, market_data
 
 
-class Portfolio(TickerGroup):
+class Portfolio(TickerGroup, FundamentalMixin):
     """
     Used to predict future growth and volatility.
     Can show the efficient frontier and this portfolio plotted on it.
@@ -144,6 +144,15 @@ class Portfolio(TickerGroup):
         roe = (total_eps / total_bv * 100)
         return pe, roe
 
+    def get_current_price(self):
+        """Total portfolio price, excluding indices and tickers without financial reports."""
+        return sum(q * p for (sym, mkt), q, p in zip(
+            zip(self.symbols, self.markets), self.quantities, self.current_prices)
+            if p and p > 0 and (sym, mkt) in self.tickers_dictionary)
+
+    def get_name(self):
+        return "Portfolio"
+
     def plot_concentric_pie(self, ax=None):
         """Two pies: left=tickers sorted by sector, right=sector+industry concentric."""
         if ax is None:
@@ -257,11 +266,77 @@ class Portfolio(TickerGroup):
                 ax.plot(self.portfolio_beta, growth_pct, 'ro', markersize=12, 
                        label='Portfolio', zorder=5)
 
+    def _get_plot_data(self):
+        """Aggregate financial time series across all holdings for plot_me."""
+        if hasattr(self, '_plot_data_cache'):
+            return self._plot_data_cache
+        series = {k: [] for k in ("bv", "eps", "revenue_ps", "operating_cf", "free_cf", "prices")}
+        price_dfs = []
 
+        for sym, mkt, qty in zip(self.symbols, self.markets, self.quantities):
+            ticker = self.tickers_dictionary.get((sym, mkt))
+            if ticker is None:
+                continue
+            try:
+                d = ticker._get_plot_data()
+            except Exception as e:
+                print(f"Skipping {sym}:{mkt} in portfolio plot: {e}")
+                continue
 
-class HistoricPortfolio(Portfolio):
-    """A portfolio with buy & sell events for tracking past performance."""
-    pass
+            amount = qty if qty > 0 else 1
+            times = d["times"]
+            for key in series:
+                src_key = key + "_ps" if key in ("operating_cf", "free_cf") else key
+                series[key].append(pd.Series(d[src_key] * amount, index=times))
+
+            try:
+                hist = ticker.yahoo_info.yf_ticker.history(period="10y")["Close"]
+                price_dfs.append(hist * amount)
+            except Exception:
+                pass
+
+        if not series["eps"]:
+            return None
+
+        def aggregate(series_list):
+            resampled = [s.resample("ME").last().ffill() for s in series_list]
+            return pd.concat(resampled, axis=1).ffill().sum(axis=1)
+
+        agg = {k: aggregate(v) for k, v in series.items()}
+        times = list(agg["eps"].index)
+
+        # Store price_dfs for _get_plot_price_data
+        self._price_dfs = price_dfs
+        
+        self._plot_data_cache = {
+            "times": times,
+            "bv": np.array(agg["bv"]),
+            "eps": np.array(agg["eps"]),
+            "revenue_ps": np.array(agg["revenue_ps"]),
+            "operating_cf": np.array(agg["operating_cf"]),
+            "free_cf": np.array(agg["free_cf"]),
+            "prices": np.array(agg["prices"]),
+        }
+        return self._plot_data_cache
+
+    def _get_plot_price_data(self):
+        """Daily portfolio price history for the bottom price graph. Cached separately."""
+        if hasattr(self, '_plot_price_data_cache'):
+            return self._plot_price_data_cache
+        price_dfs = getattr(self, '_price_dfs', [])
+        if price_dfs:
+            portfolio_daily = pd.concat(price_dfs, axis=1).ffill().sum(axis=1)
+        else:
+            portfolio_daily = pd.Series(dtype=float)
+        self._plot_price_data_cache = {
+            "price_times": portfolio_daily.index,
+            "price_values": portfolio_daily,
+            "new_price_times": None,
+            "new_price_values": None,
+            "price_series": portfolio_daily,
+        }
+        return self._plot_price_data_cache
+
 
 
 class PortfolioGui(QWidget):
@@ -332,16 +407,25 @@ class PortfolioGui(QWidget):
         if portfolio.has_holdings:
             try:
                 pe, roe = portfolio.get_weighted_stats()
-                stats_text = "PE: {:.1f}  |  ROE: {:.1f}%".format(pe, roe)
+                eps_growth = portfolio.get_growth_rate("eps")
+                irr = portfolio.get_irr()
+                capm_discount = portfolio.get_capm_discount()
+                stats_text = "PE: {:.1f}  |  ROE: {:.1f}%  |  Growth: {:.1f}%  |  IRR: {:.1f}%  |  CAPM: {:.0f}%".format(
+                    pe, roe, eps_growth, irr, capm_discount)
             except Exception as e:
-                stats_text = "PE/ROE: unavailable ({})".format(e)
+                stats_text = "Stats unavailable ({})".format(e)
             self._stats_lbl = QLabel(stats_text)
             self._stats_lbl.setStyleSheet("font-size: 12px; padding: 4px; color: gray;")
+            self._stats_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
             self._stats_layout.addWidget(self._stats_lbl)
 
         btn = QPushButton("Open Screener")
         btn.clicked.connect(self._open_screener)
         self._stats_layout.addWidget(btn)
+
+        btn_plot = QPushButton("Plot Fundamentals")
+        btn_plot.clicked.connect(self._plot_portfolio)
+        self._stats_layout.addWidget(btn_plot)
 
         # Optimal / Min Variance buttons on the same line
         opt_row = QHBoxLayout()
@@ -402,6 +486,11 @@ class PortfolioGui(QWidget):
         df = self._portfolio.to_df()
         self._screener_window = tickers_gui(df)
         self._screener_window.show()
+
+    def _plot_portfolio(self):
+        fig = self._portfolio.plot_me(show=False)
+        if fig:
+            fig.show()
 
     def _open_portfolio_builder(self):
         from gui.portfolio_builder import PortfolioBuilderDialog
@@ -521,12 +610,6 @@ class PortfolioGui(QWidget):
             import traceback
             traceback.print_exc()
 
-class HistoricPortfolio(Portfolio):
-    """
-    A portfolio who also includs buy & sell events. Allows tracking past performance
-    todo: use in portfolio_analyzer.py (instead of direct calculation)
-    """
-    pass
 
 
 if __name__ == '__main__':

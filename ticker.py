@@ -91,6 +91,18 @@ def calculate_beta(asset_returns: pd.Series, market_returns: pd.Series) -> float
     return asset_returns.loc[common].cov(market_returns.loc[common]) / market_var
 
 
+def calculate_beta_from_history(yf_ticker, market_returns: pd.Series) -> float:
+    """Calculate beta for a single yfinance ticker object from its price history.
+    Used as a fallback when yfinance .info doesn't provide beta."""
+    try:
+        hist = yf_ticker.history(period="10y")["Close"].iloc[::30]
+        asset_returns = hist.pct_change().dropna()
+        return calculate_beta(asset_returns, market_returns)
+    except Exception as e:
+        print(f"Beta fallback calculation failed: {e}")
+        return np.nan
+
+
 market_data = MarketDataCache()
 
 
@@ -155,7 +167,334 @@ def search_growth(npv_function, price, min_growth,
     return irr
 
 
-class Ticker:
+def build_dcf_model(average_annual_free_cash_flow, book_value, diluted_shares, growth_rate_pct, last_annual_date,
+                    add_bv=NPV_ASSUMPTIONS["add_book_value"],
+                    forward_to_present=NPV_ASSUMPTIONS["forward_to_present"],
+                    short_term_is_linear=NPV_ASSUMPTIONS["short_term_is_linear"],
+                    long_term_growth_duration=NPV_ASSUMPTIONS["long_term_growth_duration"],
+                    short_term_growth_duration=NPV_ASSUMPTIONS["short_term_growth_duration"],
+                    maximal_long_term_growth_rate=NPV_ASSUMPTIONS["maximal_long_term_growth_rate_percent"]/100,
+                    linear_growth=0):
+    """
+    Build a DCF valuation model. Returns calc_npv(discount_rate) -> intrinsic value per unit.
+
+    Parameters
+    ----------
+    average_annual_free_cash_flow : float — average annual free cash flow
+    book_value : float — book value per unit (per-share for Ticker, total for Portfolio)
+    diluted_shares : float — number of units to divide by (shares for Ticker, 1 for Portfolio)
+    growth_rate_pct : float — short-term growth rate in percent
+    last_annual_date : datetime — date of last annual report (for forward_to_present)
+    linear_growth : float — annual linear FCF increment (only used when short_term_is_linear)
+    """
+    forcasted_short_term_growth_rate = growth_rate_pct / 100
+    forcasted_long_term_growth_rate = np.min([maximal_long_term_growth_rate, forcasted_short_term_growth_rate])
+    # estimation for the first next cashflow (multiply in the growth rate once)
+    if short_term_is_linear:
+        forcasted_long_term_growth_rate = maximal_long_term_growth_rate  # keep it independent of the log-regression
+
+    def calc_npv(discount_rate):
+        assert discount_rate > -100E-2, "discontinuity at -1"
+        # we calculate the q of the geometric series
+        short_term_q = (1 + forcasted_short_term_growth_rate) / (1 + discount_rate)
+        long_term_q = (1 + forcasted_long_term_growth_rate) / (1 + discount_rate)
+
+        # sum over the short term
+        if not short_term_is_linear:
+            first_short_term = average_annual_free_cash_flow * short_term_q
+            last_short_term = average_annual_free_cash_flow * (short_term_q ** short_term_growth_duration)
+            if short_term_q == 1:  # discontinuity point
+                sum_discounted_fcf_short_term = first_short_term * short_term_growth_duration
+            else:
+                sum_discounted_fcf_short_term = (first_short_term - last_short_term * short_term_q) / (1 - short_term_q)
+        else:
+            # there is no easy formula for *discounted* constant addition, we will calculate explicitly
+            terms = np.arange(1, short_term_growth_duration + 1)
+            fcf = average_annual_free_cash_flow + linear_growth * terms
+            dfcf = fcf / (1 + discount_rate) ** terms
+            sum_discounted_fcf_short_term = np.sum(dfcf)
+            last_short_term = dfcf[-1]
+
+        # and from its ending to eternity
+        first_long_term = last_short_term * long_term_q
+        if long_term_growth_duration < 0:
+            if long_term_q >= 1:  # edge cases
+                sum_discounted_fcf_long_term = np.sign(first_long_term) * np.inf
+            elif long_term_q <= -1:
+                sum_discounted_fcf_long_term = np.nan
+            else:
+                sum_discounted_fcf_long_term = first_long_term / (discount_rate - forcasted_long_term_growth_rate)
+        else:  # (a1-an*q)/(1-q)
+            last_long_term_times_q = last_short_term * long_term_q ** (long_term_growth_duration + 1)
+            if long_term_q == 1:  # discontinuity point
+                sum_discounted_fcf_long_term = first_long_term * long_term_growth_duration
+            else:
+                sum_discounted_fcf_long_term = (first_long_term - last_long_term_times_q) / (1 - long_term_q)
+
+        intrinsic_value_dcf = (sum_discounted_fcf_short_term + sum_discounted_fcf_long_term) / diluted_shares
+        if add_bv:
+            intrinsic_value_dcf += book_value
+        if forward_to_present:
+            years = FundamentalMixin._calculate_time_forward(last_annual_date)
+            intrinsic_value_dcf *= (discount_rate + 1) ** years
+        return intrinsic_value_dcf
+
+    return calc_npv
+
+
+class FundamentalMixin:
+    """
+    Mixin providing shared financial analysis methods for both Ticker and Portfolio.
+    This class represent an object which we know the financial data of.
+    Subclasses must implement:
+        _get_plot_data() -> dict   (time series of BV, EPS, FCF, prices)
+        get_current_price() -> float  (current total price: share price for Ticker, portfolio value for Portfolio)
+    """
+
+    @staticmethod
+    def _calculate_time_forward(last_annual_date):
+        return (datetime.datetime.now() - last_annual_date).days / 365.25
+
+    def get_growth_rate(self, field="eps", linear=False):
+        """Annualized growth rate via log-linear regression on the given field (eps, bv, revenue_ps).
+        linear=True: linear regression slope (absolute annual change)."""
+        data = self._get_plot_data()
+        if data is None or field not in data:
+            return np.nan
+        values = data[field]
+        times = data["times"]
+        if len(values) < 3 or (not linear and (values <= 0).any()):
+            return np.nan
+        first_date = times[0]
+        years = np.array([(d - first_date).days / 365.25 for d in times])
+        try:
+            if linear:
+                b, _ = np.polyfit(years, values, 1)
+                return b
+            else:
+                b, _ = np.polyfit(years, np.log(values), 1)
+                return (np.exp(b) - 1) * 100
+        except Exception:
+            return np.nan
+
+    def get_projected_pe(self):
+        """PE using linear extrapolation of earnings to today."""
+        from numpy.polynomial.polynomial import Polynomial
+        data = self._get_plot_data()
+        if data is None:
+            return np.nan
+        eps = data["eps"]
+        times = data["times"]
+        if len(eps) < 2:
+            return np.nan
+        days = np.array([(t - times[0]).days for t in times])
+        poly_fit = Polynomial.fit(days, eps, deg=1)
+        earnings_fit = poly_fit.convert().coef
+        now_days = (datetime.datetime.now() - times[0]).days
+        forecasted_eps = earnings_fit[0] + now_days * earnings_fit[1]
+        if forecasted_eps <= 0:
+            return np.nan
+        return self.get_current_price() / forecasted_eps
+
+    def _build_dcf_from_plot_data(self, growth_rate=None, **kwargs):
+        """Build a DCF model from _get_plot_data. Returns (calc_npv, price) or (None, None)."""
+        data = self._get_plot_data()
+        if data is None:
+            return None, None
+        gr = growth_rate if growth_rate is not None else self.get_growth_rate("eps")
+        if np.isnan(gr):
+            return None, None
+        price = self.get_current_price()
+        if price <= 0:
+            return None, None
+
+        avg_fcf = np.mean(data.get("free_cf_ps", data["free_cf"]))
+
+        calc_npv = build_dcf_model(
+            average_annual_free_cash_flow=avg_fcf,
+            book_value=data["bv"][-1] if len(data["bv"]) > 0 else 0,
+            diluted_shares=1,
+            growth_rate_pct=gr,
+            last_annual_date=data["times"][-1] if data["times"] else datetime.datetime.now(),
+            forward_to_present=True,
+            **kwargs,
+        )
+        return calc_npv, price
+
+    def get_irr(self, linear=False):
+        """DCF-based IRR. If linear=True, uses linear growth model."""
+        try:
+            if linear:
+                data = self._get_plot_data()
+                if data is None:
+                    return np.nan
+                avg_fcf = np.mean(data.get("free_cf_ps", data["free_cf"]))
+                avg_eps = np.mean(data["eps"])
+                eps_slope = self.get_growth_rate("eps", linear=True)
+                calc_npv, price = self._build_dcf_from_plot_data(
+                    short_term_is_linear=True,
+                    linear_growth=eps_slope * avg_fcf / avg_eps if avg_eps != 0 else 0,
+                    long_term_growth_duration=LINEAR_IRR_CONFIG["long_term_growth_duration"],
+                    short_term_growth_duration=LINEAR_IRR_CONFIG["short_term_growth_duration"],
+                )
+            else:
+                calc_npv, price = self._build_dcf_from_plot_data()
+            if calc_npv is None:
+                return np.nan
+            return search_growth(calc_npv, price, min_growth=NPV_ASSUMPTIONS["irr_search_min"])
+        except Exception as e:
+            print(f"IRR calculation failed: {e}")
+            return np.nan
+
+    def get_capm_discount(self):
+        """CAPM discount ratio: how much the DCF intrinsic value differs from market price using CAPM rate."""
+        try:
+            calc_npv, price = self._build_dcf_from_plot_data()
+            if calc_npv is None:
+                return np.nan
+            beta = getattr(self, 'portfolio_beta', None) or (self.statistics.get("beta") if hasattr(self, 'statistics') else None)
+            if beta is None or np.isnan(beta):
+                return np.nan
+            rfr = market_data.get_risk_free_rate()
+            mkt = market_data.get_market_return()
+            capm_npv = calc_npv(rfr + beta * (mkt - rfr))
+            return 100 * (capm_npv - price) / price
+        except Exception:
+            return np.nan
+
+    def get_intrinsic_value(self, discount_rate=NPV_COMMON["discount_rate_percent"]/100, **kwargs):
+        """DCF intrinsic value at the given discount rate."""
+        calc_npv, _ = self._build_dcf_from_plot_data(**kwargs)
+        if calc_npv is None:
+            return np.nan
+        return calc_npv(discount_rate)
+
+    def get_title(self):
+        irr = self.get_irr()
+        linear_irr = self.get_irr(linear=True)
+        pe = self.get_projected_pe()
+        price = self.get_current_price()
+        name = self.get_name() if hasattr(self, 'get_name') else ""
+        return "{} ({:,.2f}) — IRR {:.1f}% | Linear {:.1f}% | PE {:.1f}".format(name, price, irr, linear_irr, pe)
+
+    def plot_me(self, show=True):
+        data = self._get_plot_data()
+        if data is None:
+            print("Cannot plot: no data available")
+            return
+
+        price_data = self._get_plot_price_data()
+        fig = plt.figure()
+        gs = fig.add_gridspec(4, 2)
+
+        times = data["times"]
+        bv = data["bv"]
+        eps = data["eps"]
+        prices = data["prices"]
+
+        # 00 - Book Value
+        ax = fig.add_subplot(gs[0, 0])
+        format_axis(ax)
+        ax.plot(times, bv, '-', label="book value")
+        ax.legend(framealpha=0.4)
+
+        # 01 - EPS
+        ax = fig.add_subplot(gs[0, 1])
+        format_axis(ax)
+        ax.plot(times, eps, '-', label="eps")
+        ax.legend(framealpha=0.4)
+
+        # 10 - Cash Flow
+        ax = fig.add_subplot(gs[1, 0])
+        format_axis(ax)
+        ax.plot(times, data["operating_cf"], '-', label="operating")
+        ax.plot(times, data["free_cf"], '-', label="free")
+        ax.legend(framealpha=0.4)
+
+        # 11 - Price
+        ax = fig.add_subplot(gs[1, 1])
+        format_axis(ax)
+        ax.plot(times, prices, '-', label="price")
+        ax.legend(framealpha=0.4)
+
+        # 21 - PE & EPS Growth
+        ax = fig.add_subplot(gs[2, 1])
+        format_axis(ax)
+        pe_ratios = prices / eps
+        line1 = ax.plot(times, pe_ratios, '-', label="PE")
+        ax.set_ylabel("PE")
+
+        ax2 = ax.twinx()
+        times_arr = np.array(times)
+        dt_days = np.array(times_arr[1:] - times_arr[:-1], dtype='timedelta64[D]')
+        dt_years = dt_days / np.timedelta64(1, 'D') / 365.25
+        median_spacing = np.median(dt_years)
+
+        if median_spacing < 0.5:
+            eps_series = pd.Series(eps, index=times)
+            eps_shifted = eps_series.shift(12)
+            yoy = (eps_series / eps_shifted - 1) * 100
+            yoy = yoy.dropna()
+            line2 = ax2.plot(yoy.index, yoy.values, label="EPS Growth (YoY)", color="C1")
+        else:
+            time_for_deltas = times_arr[1:]
+            de = eps[1:] / eps[:-1]
+            growths = de ** (1 / dt_years)
+            growths = (growths - 1) * 100
+            line2 = ax2.plot(time_for_deltas, growths, label="EPS Growth", color="C1")
+
+        ax2.set_ylabel("Growth")
+        lines = line1 + line2
+        labels = [l.get_label() for l in lines]
+        ax.legend(lines, labels, framealpha=0.4)
+
+        # wide price graph with interactive selector
+        ax = fig.add_subplot(gs[-1, :])
+        format_axis(ax)
+        ax.plot(price_data["price_times"], price_data["price_values"], '-')
+        if price_data.get("new_price_times") is not None and len(price_data["new_price_times"]) > 0:
+            ax.plot(price_data["new_price_times"], price_data["new_price_values"])
+
+        self._price_series = price_data["price_series"]
+        ax.set_xlim((self._price_series.index[0], self._price_series.index[-1]))
+
+        rectprops = dict(facecolor='cyan', alpha=0.15)
+        self._widget = matplotlib.widgets.SpanSelector(ax,
+                                                       lambda f, t: self.show_delta(
+                                                           mdates.num2date(f).replace(tzinfo=None),
+                                                           mdates.num2date(t).replace(tzinfo=None)),
+                                                       'horizontal', props=rectprops, useblit=True)
+
+        fig.set_layout_engine('tight')
+        fig.suptitle(self.get_title())
+
+        if show:
+            plt.show()
+        else:
+            return fig
+
+    def show_delta(self, from_date, to_date):
+        """Print price growth over a selected range on the price graph."""
+        index = self._price_series.index.unique()
+        timezone = index.tzinfo
+        from_date = from_date.replace(tzinfo=timezone)
+        to_date = to_date.replace(tzinfo=timezone)
+        start_price = self._price_series.loc[index[index.get_indexer([from_date], method="nearest")]].iloc[0]
+        end_price = self._price_series.loc[index[index.get_indexer([to_date], method="nearest")]].iloc[0]
+        change = (end_price - start_price) / start_price
+        days = (to_date - from_date).days
+        if days == 0:
+            print("price at %s: %.2f" % (from_date.date(), start_price))
+            return
+        years = days / 365.25
+        yoy_change = (change + 1) ** (1 / years) - 1
+        print("")
+        print("during %s days (%.1f years):" % (days, years))
+        print("price growth: " + "%.2f%%" % (change * 100))
+        print("yearly growth: " + "%.2f%%" % (yoy_change * 100))
+
+
+class Ticker(FundamentalMixin):
 
     def __calculate_stats(self):
         statistics = self.statistics
@@ -304,7 +643,7 @@ class Ticker:
         # earnings trend (slope) (total, not per-stock)
         yearly_earnings = [statement["Net Income"] for statement in all_yearly_income_statements]
         poly_fit = Polynomial.fit(years, yearly_earnings, deg=1)
-        earnings_fit = poly_fit.coef  # TODO: --- check what changed when I removed the .convert() ---
+        earnings_fit = poly_fit.convert().coef
         statistics["earnings_yearly_trend"] = earnings_fit[1]  # keep the slope
 
         # earnings growth (exponential)
@@ -331,7 +670,7 @@ class Ticker:
         # revenues trend (total, not per-stock)
         yearly_revenues = [statement["Total Revenue"] for statement in all_yearly_income_statements]
         poly_fit = Polynomial.fit(years, yearly_revenues, deg=1)
-        revenues_fit = poly_fit.coef
+        revenues_fit = poly_fit.convert().coef
         statistics["revenues_yearly_trend"] = revenues_fit[1]  # keep the slope
 
         # revenue growth
@@ -406,170 +745,53 @@ class Ticker:
                cashflow_statement["Purchase/Sale of Prop,Plant,Equip: Net"]
 
     @staticmethod
-    def __calculate_time_forward(last_annual_date):
-        now = datetime.datetime.now()
-        return (now - last_annual_date).days / 365.25
-
-    @staticmethod
     def __calculate_year_diff(annual_dates):
         first_date = annual_dates[0]
         return [(date - first_date).days / 365.25 for date in annual_dates]
 
-    def get_irr(self):
-        """ a wrapper of _calc_dcf_intrinsic_values for the gui part (with current price) """
-        _, irr = self._calc_dcf_intrinsic_values(forward_to_present=True)
-        _, linear_irr = self._calc_dcf_intrinsic_values(
-            growth_rate=self.statistics["growth_rate"],
-            forward_to_present=True,
-            short_term_is_linear=True,
-            long_term_growth_duration=LINEAR_IRR_CONFIG["long_term_growth_duration"],
-            short_term_growth_duration=LINEAR_IRR_CONFIG["short_term_growth_duration"]
-        )
-        return irr, linear_irr
+    def get_current_price(self):
+        return self.yahoo_info.get_stock_price_now()
+
+    def get_growth_rate(self, field="eps", linear=False):
+        """Return pre-computed growth rate from statistics if available."""
+        if not linear:
+            field_map = {"eps": "growth_rate", "bv": "bv_growth_rate", "revenue_ps": "revenue_growth_rate"}
+            stat_key = field_map.get(field)
+            if stat_key and hasattr(self, 'statistics') and stat_key in self.statistics:
+                return self.statistics[stat_key]
+        return super().get_growth_rate(field, linear=linear)
 
     def _calculate_intrinsic_values(self, diluted_shares, stock_price, last_annual_date):
         statistics = self.statistics
+        discount_rate = NPV_COMMON["discount_rate_percent"] / 100
 
-        # for reference:
-        # approximate_bond_10 = 0.95 * 0.01  # updated @ 19.12.2020
-        # approximate_bond_30 = 1.7 * 0.01  # updated @ 19.12.2020
-        discount_rate = NPV_COMMON["discount_rate_percent"] / 100  # the wished return rate of an investment (used only for the basic calculations)
-
-        # --- basic_discount_value - todo: check my formula
-        #
+        # --- basic_discount_value ---
         #   current book_value plus the summary of the discounted eps till the end of time
         #   assumes fixed eps and a pre-selected discount ratio
         book_value = statistics["book_value"]
         eps = statistics["eps"]
         statistics["basic_discount_value"] = book_value + eps * ((1 + discount_rate) / discount_rate)
-
-        # basic_discount_ratio todo: polish details so can be used in the graphical part
         discount_value = statistics["basic_discount_value"]
         statistics["basic_discount_ratio"] = 100 * (discount_value - stock_price) / stock_price
 
         # --- dcf model ---
-        statistics["intrinsic_value_dcf"], statistics["irr[%]"] = self._calc_dcf_intrinsic_values()
+        statistics["intrinsic_value_dcf"] = self.get_intrinsic_value(discount_rate)
+        statistics["irr[%]"] = self.get_irr()
         statistics["dcf_discount_ratio"] = 100 * (statistics["intrinsic_value_dcf"] - stock_price) / stock_price
 
         # --- capm ---
         beta = statistics.get("beta")
+        if beta is None or np.isnan(beta):
+            beta = calculate_beta_from_history(self.yahoo_info.yf_ticker, market_data.get_market_monthly_returns())
+            if not np.isnan(beta):
+                statistics["beta"] = beta
         if beta is not None and not np.isnan(beta):
             rfr = market_data.get_risk_free_rate()
             mkt = market_data.get_market_return()
             capm_rate = rfr + beta * (mkt - rfr)
             statistics["capm_interest"] = capm_rate * 100
-            statistics["capm_npv"] = self._get_calc_npv()(capm_rate)
+            statistics["capm_npv"] = self.get_intrinsic_value(capm_rate)
             statistics["capm_discount_ratio"] = 100 * (statistics["capm_npv"] - stock_price) / stock_price
-
-    def _get_calc_npv(self,
-                   growth_rate=None,
-                   add_bv=NPV_ASSUMPTIONS["add_book_value"],
-                   forward_to_present=NPV_ASSUMPTIONS["forward_to_present"],
-                   short_term_is_linear=NPV_ASSUMPTIONS["short_term_is_linear"],
-                   long_term_growth_duration=NPV_ASSUMPTIONS["long_term_growth_duration"],
-                   short_term_growth_duration=NPV_ASSUMPTIONS["short_term_growth_duration"],
-                   maximal_long_term_growth_rate=NPV_ASSUMPTIONS["maximal_long_term_growth_rate_percent"]/100,
-                   ):
-        #
-        # --- The Discounted Free Cash Flow Model (according to the youtube course): ---
-        #
-        #   10 years of data are preffered, we use only 4
-
-        use_ttm = self.reports.has_full_ttm()
-        all_yearly_cash_flows = self.reports.get_reports_ascending("annual", "cash_flow", use_ttm)
-        statistics = self.statistics
-        book_value = statistics["book_value"]
-        last_annual_date = statistics["updated at"]
-        diluted_shares = statistics["shares (diluted)"]
-
-        if growth_rate is not None:
-            forcasted_short_term_growth_rate = growth_rate / 100
-        else:
-            forcasted_short_term_growth_rate = statistics["growth_rate"] / 100
-        forcasted_long_term_growth_rate = np.min([maximal_long_term_growth_rate, forcasted_short_term_growth_rate])
-        # estimation for the first next cashflow (multiply in the growth rate once)
-        average_annual_free_cash_flow = np.mean(
-            [Ticker.__calculate_free_cash_flow(report) for report in all_yearly_cash_flows])
-        if short_term_is_linear:
-            # only use earnings, for equity growth, we need to think on a different model (quadratic) todo
-            # no ttm in the average
-            average_earnings = np.average(self.reports.get_field_as_list("income_statement", "annual", "Net Income"))
-            linear_growth = statistics["earnings_yearly_trend"] * average_annual_free_cash_flow / average_earnings
-            forcasted_long_term_growth_rate = maximal_long_term_growth_rate  # keep it independent of the log-regression
-
-        def calc_npv(discount_rate):
-            assert discount_rate > -100E-2, "discontinuity at -1"
-            # we calculate the q of the geometric series
-            short_term_q = (1 + forcasted_short_term_growth_rate) / (1 + discount_rate)
-            long_term_q = (1 + forcasted_long_term_growth_rate) / (1 + discount_rate)
-
-            # sum over the short term
-            if not short_term_is_linear:
-                first_short_term = average_annual_free_cash_flow * short_term_q
-                last_short_term = average_annual_free_cash_flow * (short_term_q ** short_term_growth_duration)
-                if short_term_q == 1:  # discontinuity point
-                    sum_discounted_fcf_short_term = first_short_term * short_term_growth_duration
-                else:
-                    sum_discounted_fcf_short_term = (first_short_term - last_short_term * short_term_q) / (1 - short_term_q)
-            else:
-                # there is no easy formula for *discounted* constant addition, we will calculate explicitly
-                terms = np.arange(1, short_term_growth_duration + 1)
-                fcf = average_annual_free_cash_flow + linear_growth * terms
-                dfcf = fcf / (1 + discount_rate) ** terms
-                sum_discounted_fcf_short_term = np.sum(dfcf)
-                last_short_term = dfcf[-1]
-
-            # and from its ending to eternity
-            first_long_term = last_short_term * long_term_q
-            if long_term_growth_duration < 0:
-                if long_term_q >= 1:  # edge cases
-                    sum_discounted_fcf_long_term = np.sign(first_long_term)*np.inf
-                elif long_term_q <= -1:
-                    sum_discounted_fcf_long_term = np.nan
-                else:
-                    sum_discounted_fcf_long_term = first_long_term / (discount_rate - forcasted_long_term_growth_rate)
-            else:  # (a1-an*q)/(1-q)
-                last_long_term_times_q = last_short_term * long_term_q ** (long_term_growth_duration + 1)
-                if long_term_q == 1:  # discontinuity point
-                    sum_discounted_fcf_long_term = first_long_term * long_term_growth_duration
-                else:
-                    sum_discounted_fcf_long_term = (first_long_term - last_long_term_times_q) / (1 - long_term_q)
-
-            intrinsic_value_dcf = (sum_discounted_fcf_short_term + sum_discounted_fcf_long_term) / diluted_shares
-            if add_bv:
-                intrinsic_value_dcf += book_value
-            if forward_to_present:
-                years = Ticker.__calculate_time_forward(last_annual_date)
-                intrinsic_value_dcf *= (discount_rate + 1) ** years
-            return intrinsic_value_dcf
-
-        return calc_npv
-
-    def _calc_dcf_intrinsic_values(self,
-                                   discount_rate=NPV_COMMON["discount_rate_percent"]/100,
-                                   forward_to_present=False,
-                                   **kwargs
-                                   ):
-
-        old_stock_price = self.statistics["price on update"]
-        if forward_to_present:
-            stock_price = self.yahoo_info.get_stock_price_now()
-        else:
-            stock_price = old_stock_price
-        calc_npv = self._get_calc_npv(**kwargs)  # a lambda to calculate the npv given a wanted growth
-        intrinsic_value = calc_npv(discount_rate)
-        # calculate the intrinsic rate of return (by dcf model):
-        if intrinsic_value > 0 and self.statistics["eps"] > 0:   # negative values will prefer high discount (unintuitivly)
-            delta = 0.1/100
-            #start_at = max(forcasted_long_term_growth_rate + delta, 0) if long_term_growth_duration < 0 else 0  # todo: add negative if not infinite
-            start_at = NPV_ASSUMPTIONS["irr_search_min"]
-            if np.isnan(start_at):
-                start_at=0
-            irr = search_growth(calc_npv, stock_price, start_at, 1, delta)
-        else:
-            irr = np.nan
-
-        return intrinsic_value, irr
 
     def _calculate_quick_filter(self):
         """ The function checks several conditions which determine if its a
@@ -762,151 +984,70 @@ class Ticker:
         prices = [self.yahoo_info.get_stock_price_at_date(date["day"], date["month"], date["year"]) for date in dates]
         return prices
 
-    def plot_me(self, show=True):
-        fig = plt.figure()
-        gs = fig.add_gridspec(4, 2)
+    def get_name(self):
+        return self.symbol
 
-        # 00 - Book Value
-        ax = fig.add_subplot(gs[0, 0])
-        label = "book value"
-        equity = np.array(self.reports.get_field_as_list("balance_sheet", "annual", "Total Equity", add_ttm=True))
-        quantity = np.array(
-            self.reports.get_field_as_list("income_statement", "annual", "Diluted Weighted Average Shares",
-                                           add_ttm=True))
-        values = equity / quantity
-        times = self.reports.get_reports_dates("annual", add_ttm=True)
-        format_axis(ax)
-        ax.plot(times, values, '-', label=label)
-        ax.legend(framealpha=0.4)
+    def _get_plot_data(self):
+        """Extract all time series needed for plot_me."""
+        if hasattr(self, '_plot_data_cache'):
+            return self._plot_data_cache
+        add_ttm = True
+        times = self.reports.get_reports_dates("annual", add_ttm=add_ttm)
 
-        # 01 - EPS
-        ax = fig.add_subplot(gs[0, 1])
-        label = "eps"
-        earnings = np.array(self.reports.get_field_as_list("income_statement", "annual", "Net Income", add_ttm=True))
-        eps = earnings / quantity
-        format_axis(ax)
-        ax.plot(times, eps, '-', label=label)
-        ax.legend(framealpha=0.4)
+        equity = np.array(self.reports.get_field_as_list("balance_sheet", "annual", "Total Equity", add_ttm=add_ttm))
+        shares = np.array(self.reports.get_field_as_list("income_statement", "annual",
+                                                          "Diluted Weighted Average Shares", add_ttm=add_ttm))
+        bv = equity / shares
 
-        # 10 - {Free, Operating} Cash Flow
-        ax = fig.add_subplot(gs[1, 0])
-        format_axis(ax)
-        # label = ("operating", "free")
-        operating = np.array(
-            self.reports.get_field_as_list("cash_flow", "annual", "Cash Flow from Operating Activities", add_ttm=True))
-        capex = np.array(self.reports.get_field_as_list("cash_flow", "annual", "Purchase/Sale of Prop,Plant,Equip: Net",
-                                                        add_ttm=True))
+        earnings = np.array(self.reports.get_field_as_list("income_statement", "annual", "Net Income", add_ttm=add_ttm))
+        eps = earnings / shares
+
+        try:
+            revenue = np.array(self.reports.get_field_as_list("income_statement", "annual", "Revenue", add_ttm=add_ttm))
+            revenue_ps = revenue / shares
+        except Exception:
+            revenue_ps = np.full_like(eps, np.nan)
+
+        operating = np.array(self.reports.get_field_as_list("cash_flow", "annual",
+                                                             "Cash Flow from Operating Activities", add_ttm=add_ttm))
+        capex = np.array(self.reports.get_field_as_list("cash_flow", "annual",
+                                                         "Purchase/Sale of Prop,Plant,Equip: Net", add_ttm=add_ttm))
         free_cf = operating + capex
-        label_n_values = [["operating", operating], ["free", free_cf]]
-        for label, values in label_n_values:
-            ax.plot(times, values, '-', label=label)
-        ax.legend(framealpha=0.4)
 
-        # 11 - price & intrinsic value
-        # IDK how to calculate the intrinsic value, so just price
-        ax = fig.add_subplot(gs[1, 1])
-        format_axis(ax)
-        label = "price"
-        prices = np.array(self.get_price_at_report_dates('annual', add_ttm=True))
-        ax.plot(times, prices, '-', label=label)
-        ax.legend(framealpha=0.4)
+        # per-share versions for portfolio aggregation
+        operating_ps = operating / shares
+        free_cf_ps = free_cf / shares
 
-        # 21 - PE Ratio & Annual Earnings Growth Rate
-        ax = fig.add_subplot(gs[2, 1])
-        format_axis(ax)
-        label = "PE"
-        pe_ratios = prices / eps 
-        line1 = ax.plot(times, pe_ratios, '-', label=label)
-        ax.set_ylabel("PE")
+        prices = np.array(self.get_price_at_report_dates('annual', add_ttm=add_ttm))
 
-        ax2 = ax.twinx()
-        label = "EPS Growth"
-        times = np.array(times)
-        time_for_deltas = times[1:]
-        dt = np.array(times[1:] - times[:-1], dtype='timedelta64[D]')
-        dt = dt / np.timedelta64(1, 'D') / 365.25
-        de = eps[1:] / eps[:-1]
-        growths = de ** (1 / dt)
-        growths = (growths - 1) * 100
-        line2 = ax2.plot(time_for_deltas, growths, label=label, color="C1")
-        ax2.set_ylabel("Growth")
-        
-        # Combine legends from both axes
-        lines = line1 + line2
-        labels = [l.get_label() for l in lines]
-        ax.legend(lines, labels, framealpha=0.4)
+        self._plot_data_cache = {
+            "times": times,
+            "bv": bv,
+            "eps": eps,
+            "revenue_ps": revenue_ps,
+            "operating_cf": operating,
+            "free_cf": free_cf,
+            "operating_cf_ps": operating_ps,
+            "free_cf_ps": free_cf_ps,
+            "prices": prices,
+        }
+        return self._plot_data_cache
 
-        # wide price graph
-        ax = fig.add_subplot(gs[-1, :])
-        format_axis(ax)
-        # label = "price"
-        # ax.plot(times, prices, '-', label=label)  # for offline testing
-        price_times, price_values = self.get_price_graph('annual', add_ttm=self.reports.has_full_ttm())
-        ax.plot(price_times, price_values, '-')
-        new_price_times, new_price_values = self.get_price_graph_after_report('annual', add_ttm=self.reports.has_full_ttm())
-        ax.plot(new_price_times, new_price_values)
-        # ax.legend(framealpha=0.4)
-
-        # widget
-        self._price_series = pd.concat([price_values, new_price_values])
-        rectprops = dict(facecolor='cyan', alpha=0.15)
-        self.widget = matplotlib.widgets.SpanSelector(ax,
-                                                      lambda from_date, to_date: self.show_delta(
-                                                          mdates.num2date(from_date).replace(tzinfo=None),
-                                                          mdates.num2date(to_date).replace(tzinfo=None)),
-                                                      'horizontal', props=rectprops, useblit=True)
-
-        ax.set_xlim((self._price_series.index[0], self._price_series.index[-1]))
-
-        fig.set_layout_engine('tight')
-        fig.suptitle(self.symbol + " ({:,.2f}) — IRR {:.1f}% | Linear {:.1f}% | PE {:.1f}".format(
-            self.yahoo_info.get_stock_price_now(), *(self.get_irr()), self.get_projected_pe()))
-
-        if show:
-            plt.show()
-        else:
-            return fig
-
-    def show_delta(self, from_date, to_date):
-        """ called by the mpl widget to inspect price growth """
-        #  some sort of rounding of the date, think about how to reflect this to the user
-        index = self._price_series.index.unique()
-        # set timezone to allow comparing with the index
-        timezone = index.tzinfo
-        from_date = from_date.replace(tzinfo=timezone)
-        to_date = to_date.replace(tzinfo=timezone)
-        start_price = self._price_series.loc[index[index.get_indexer([from_date], method="nearest")]].iloc[0]
-        end_price = self._price_series.loc[index[index.get_indexer([to_date], method="nearest")]].iloc[0]
-        change = (end_price - start_price) / start_price
-        # not the real time delta if the market was closed
-        days = (to_date - from_date).days
-        if days == 0:
-            print("price at %s: %.2f" % (from_date.date(), start_price))
-            return
-        years = days / 365.25  # in years
-        yoy_change = (change + 1) ** (1 / years) - 1
-        print("")
-        print("during %s days (%.1f years):" % (days, years))
-        print("price growth: " + "%.2f%%" % (change * 100))
-        print("yearly growth: " + "%.2f%%" % (yoy_change * 100))
-
-    def get_projected_pe(self):
-        """ pe ratio with current price and forcasted growth of the income since the report till now """
-        # estimate income (linear fit) - crude hard copy of the trend calculation:
-        statements = self.reports.get_reports_ascending("annual", "income_statement", self.reports.has_full_ttm())
-        # - subtract some date just to convert to timedelta type
-        annual_dates = [(date - self.statistics["updated at"]).days for date in
-
-
-                        self.reports.get_reports_dates("annual", self.reports.has_full_ttm())]
-        yearly_earnings = [statement["Net Income"] for statement in statements]
-        poly_fit = Polynomial.fit(annual_dates, yearly_earnings, deg=1)
-        earnings_fit = poly_fit.convert().coef
-        forecasted_income = earnings_fit[0] + (datetime.datetime.now() - self.statistics["updated at"]).days * \
-                            earnings_fit[1]
-        diluted_shares = self.reports.get_last_report("quarterly", "income_statement")[
-            "Diluted Weighted Average Shares"]
-        return (diluted_shares * self.yahoo_info.get_stock_price_now()) / forecasted_income
+    def _get_plot_price_data(self):
+        """Daily price history for the bottom price graph. Cached separately."""
+        if hasattr(self, '_plot_price_data_cache'):
+            return self._plot_price_data_cache
+        has_ttm = self.reports.has_full_ttm()
+        price_times, price_values = self.get_price_graph('annual', add_ttm=has_ttm)
+        new_price_times, new_price_values = self.get_price_graph_after_report('annual', add_ttm=has_ttm)
+        self._plot_price_data_cache = {
+            "price_times": price_times,
+            "price_values": price_values,
+            "new_price_times": new_price_times,
+            "new_price_values": new_price_values,
+            "price_series": pd.concat([price_values, new_price_values]),
+        }
+        return self._plot_price_data_cache
 
     def get_current_pe(self):
         """
@@ -1026,8 +1167,8 @@ class TickerGroup(YahooGroup):
     def calculate_growth_forecast(self):
         print("recreating tickers and calculating growth")  # todo optimize runtime
         for symbol, market, full_symbol in zip(self.symbols, self.markets, self.full_symbols):
-            # For indices, use past growth and skip ticker creation
-            if yahoo_symbol_is_index(symbol):
+            # For indices/ETFs, use past growth and skip ticker creation
+            if not is_stock(self.yf_ticker.tickers[full_symbol]):
                 self.annual_growth_forecasts.append(self.get_past_annual_performance(symbol, market))
                 continue
             
@@ -1069,14 +1210,16 @@ class TickerGroup(YahooGroup):
                 except Exception as e:
                     print(f"{full_symbol}: error getting beta ({e})")
             
-            # Fallback: calculate from returns when Yahoo doesn't provide beta
+            # Fallback: calculate from already-fetched portfolio returns (preferred),
+            # or from individual ticker history via the shared helper
             if beta is None or (isinstance(beta, float) and np.isnan(beta)):
                 if full_symbol in monthly.columns:
                     beta = calculate_beta(monthly[full_symbol], market_returns)
-                    if np.isnan(beta):
-                        print(f"{full_symbol}: calculate_beta returned NaN (common dates < 3?)")
                 else:
-                    print(f"{full_symbol}: not in monthly.columns, cannot calculate beta")
+                    yf_single = self.yf_ticker.tickers[full_symbol]
+                    beta = calculate_beta_from_history(yf_single, market_returns)
+                if np.isnan(beta):
+                    print(f"{full_symbol}: could not calculate beta")
             
             self.beta_dictionary[full_symbol] = beta if beta is not None else np.nan
 

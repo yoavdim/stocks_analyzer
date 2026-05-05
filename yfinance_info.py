@@ -3,6 +3,7 @@
 import yfinance as yf
 import datetime
 import numpy as np
+import pandas as pd
 import os
 import json
 from pypfopt.risk_models import fix_nonpositive_semidefinite, CovarianceShrinkage
@@ -19,8 +20,8 @@ class YfinanceException(Exception):
     pass
 
 
-def yahoo_symbol_is_index(symbol:str) -> bool:
-    return symbol.startswith("%5E") or symbol.startswith("^")
+def is_stock(yf_ticker) -> bool:
+    return yf_ticker.info.get("quoteType", "") == "EQUITY"
 
 
 market_to_yf_market = {
@@ -165,7 +166,13 @@ class YahooGroup:
         if self.history is None:
             self.history = self.yf_ticker.history(period="10y")["Close"].iloc[::30]  # todo better implement period & interval (more years and real months?, maybe add overlaps)
             self.history = self.history.ffill(limit=4)  # fill short gaps (holidays, exchange mismatches) but preserve real missing data
-            self.valid_full_symbols = self.history.columns[self.history.notna().mean() >= 0.8].tolist()
+            # Valid if ≥80% non-NaN in the last 6 years, or ≥60% over the full 10 years
+            cutoff = self.history.index[-1] - pd.DateOffset(years=6)
+            recent = self.history.loc[self.history.index >= cutoff]
+            self.valid_full_symbols = [
+                col for col in self.history.columns
+                if recent[col].notna().mean() >= 0.8 and self.history[col].notna().mean() >= 0.6
+            ]
 
     def get_monthly_growths(self):
         p1 = self.history[1:]
