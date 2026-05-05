@@ -61,8 +61,8 @@ class YahooInfo:
     def get_stock_price_now(self):
         """Get the current stock price in USD, or, if the market is closed, the closing price,
         without caching, as the price continue to change"""
-        todays_data = self.yf_ticker.history(period='1d')
-        return todays_data['Close'].iloc[0]
+        todays_data = self.yf_ticker.history(period='5d')
+        return todays_data['Close'].dropna().iloc[-1]
 
     def get_stock_price_at_date(self, day, month, year):
         """Get the stock price in USD at the given date, or the closest after it if the
@@ -198,8 +198,8 @@ class YahooGroup:
     def get_stock_prices_now(self):
         """Get the current stock price, or, if the market is closed, the closing price,
         without caching, as the price continue to change"""
-        todays_data = self.yf_ticker.history(period='1d')
-        return todays_data['Close'].iloc[0]
+        todays_data = self.yf_ticker.history(period='5d')
+        return todays_data['Close'].ffill().iloc[-1]
 
 
 
