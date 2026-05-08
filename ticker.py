@@ -964,6 +964,10 @@ class Ticker(FundamentalMixin):
         self.reports = YReports(symbol, market, self.yahoo_info.yf_ticker)
         #self.reports = Reports(self.symbol, self.market)
 
+        # allow __calculate_stats to log warning in this file
+        self.warnings = list()
+        self.dcf_model = load_dcf_model(self.symbol, self.market)
+
         self.statistics = {
             # the order here is the order in the csv
             "name": self.yahoo_info.info.get("shortName"),
@@ -1020,9 +1024,6 @@ class Ticker(FundamentalMixin):
             "dcf_model_date": self.dcf_model.get("saved_at") if self.dcf_model else None
         }
 
-        # allow __calculate_stats to log warning in this file
-        self.warnings = list()
-        self.dcf_model = load_dcf_model(self.symbol, self.market)
         try:
             self.__calculate_stats()
         except Exception as err:
