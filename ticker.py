@@ -1012,7 +1012,7 @@ class Ticker(FundamentalMixin):
             "leveraged": None,
             "sector": self.yahoo_info.info.get("sector"),
             "industry": self.yahoo_info.info.get("industry"),
-            "beta": self.yahoo_info.info.get("beta"),
+            "beta": self.yahoo_info.info.get("beta"),  # code calculates locally if this field is missing
             "capm_interest": None,
             "capm_npv": None,
             "capm_discount_ratio": None,

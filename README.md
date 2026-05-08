@@ -11,8 +11,7 @@ Our tool is here to help you with all the steps in portfolio creation:
 - At the end, find the right portfolio composition to minimize risk and correlation while maintaining high growth
 - Keep track of your past investment performance
 
-    
- Our tool fetches live data, computes 40+ financial metrics per stock, and provides portfolio-level analysis including efficient frontier optimization, CAPM modeling, and DCF valuation.
+Our tool fetches live data, computes 40+ financial metrics per stock, and provides portfolio-level analysis including efficient frontier optimization, CAPM modeling, and DCF valuation.
 
 ![Portfolio Analyzer](images/portfolio%20analyzer%20example.png)
 ![Stock Screener](images/screener%20example.png)
@@ -37,6 +36,7 @@ Our tool is here to help you with all the steps in portfolio creation:
 - [Architecture](#architecture)
 - [Input Formats](#input-formats)
 - [Dependencies](#dependencies)
+- [Future Directions](#future-directions)
 - [Disclaimer](#disclaimer)
 - [License](#license)
 - [Authors](#authors)
@@ -79,7 +79,7 @@ A helper script `analyzer.sh` is included that creates the venv, installs depend
 ### Stock Screening
 - Analyze stocks across 12+ global exchanges (NASDAQ, NYSE, TPE, TYO, LON, AMS, STO, TLV, KRX, and more)
 - Compute valuation metrics (P/E, P/B, PEG, ROE, ROA, debt-to-equity, current ratio, ...)
-- Health scoring with automatic flags: *healthy*, *overvalued*, *leveraged*
+- Health scoring with configurable filters: *healthy*, *overvalued*, *leveraged* — conditions are defined in `npv_config.json` and can be customized without code changes
 - Multi-threaded fetching with 30-day ticker cache
 - Export to CSV (full and TLDR versions)
 - Sortable, filterable screener GUI with color-coded health indicators
@@ -113,6 +113,7 @@ A helper script `analyzer.sh` is included that creates the venv, installs depend
 - Real-time price target and IRR output
 - CAPM reference display (β, risk-free rate, market return)
 - Interactive price graph with growth calculation on selected ranges
+- **Save/Load DCF models** — save your valuation assumptions per ticker. Saved models are automatically used in the screener's IRR calculation. The growth phase shortens over time (uses an absolute end date), and stale models (>6 months) trigger a warning.
 
 ![DCF Calculator](images/npv%20calculator%20example.png)
 
@@ -138,7 +139,9 @@ where $CF_t$ is the projected cash flow at year $t$, $r$ is the discount rate, $
 
 $$\text{NPV}(r^*) = \text{Market Price}$$
 
-This gives the annualized return implied by the current price under the DCF assumptions — effectively answering "what growth rate is the market pricing in?" The same IRR approach is used at the portfolio level to measure historic performance: given all buy/sell transactions and the current portfolio value, solve for the single discount rate that zeroes out the net present value of all cash flows.
+This gives the annualized return implied by the current price under the DCF assumptions — effectively answering "what growth rate is the market pricing in?" When all projected cash flows are positive (positive FCF with non-decreasing growth), the NPV is monotonically decreasing in the discount rate, so the root is found efficiently using Brent's method (`scipy.optimize.brentq`). For cases where monotonicity isn't guaranteed (e.g. linear declining growth, or portfolio IRR with mixed buy/sell transactions), a linear scan is used as a fallback.
+
+The same IRR approach is used at the portfolio level to measure historic performance: given all buy/sell transactions and the current portfolio value, solve for the single discount rate that zeroes out the net present value of all cash flows.
 
 ### Risk & Return — CAPM
 
@@ -198,10 +201,12 @@ ticker_gui.py          # Stock screener GUI
 ticker.py              # Ticker class, TickerGroup, CAPM, efficient frontier
 portfolio.py           # Portfolio class, optimization, portfolio GUI
 yfinance_info.py       # Yahoo Finance data layer
+fx_converter.py        # Multi-currency FX conversion (wraps yfinance)
 reports.py             # MSN Money financial statement scraping
 yahoo_reports.py       # Yahoo Finance financial statement scraping
 bonds.py               # Bond yield-to-maturity calculator
-npv_config.json        # NPV/IRR assumptions (discount rate, growth durations, etc.)
+npv_config.json        # All configurable parameters (NPV, filters, base currency)
+dcf_models/            # Saved per-ticker DCF valuation parameters (JSON)
 gui/ticker_table.py    # Table widget with health-colored rows
 ```
 
@@ -222,6 +227,8 @@ QCOM    NASDAQ  2022-01-01  1       BUY         141.6
 MSFT    NASDAQ  2020-10-05  2       BUY         100
 ```
 
+Costs should be in the local trading currency of the exchange (USD for NYSE/NASDAQ, agora for TLV, CAD for TSE, etc.). All values are automatically converted to a common base currency internally. The base currency is configurable via `base_currency` in `npv_config.json` (default: USD).
+
 Not all columns are required. The tool adapts to the information provided:
 
 | Columns present                                        | Available features                                                                                                   |
@@ -237,6 +244,18 @@ Not all columns are required. The tool adapts to the information provided:
 - **PyPortfolioOpt** — mean-variance portfolio optimization
 - **pandas**, **numpy**, **scipy** — numerical computation
 - **matplotlib** — charting and visualization
+
+## Future Directions
+
+The core analysis pipeline is largely in place. The next steps are less about new features and more about finding data-driven ways to select the hyper-parameters of the program that currently rely on manual judgment. These are research directions rather than a concrete to-do list.
+
+- [ ] Premium data backend for backtesting (financial reports beyond the 4-year yfinance limit)
+- [ ] Basic support for viewing/using earning forecasts in the program (in dcf calculations)
+- [ ] Optimism metric per stock — aggregate earnings forecasts and sentiment via LLM-powered web search to forecast deviations in future earnings growth relative to past performance
+- [ ] ML-trained health/overvalued classification to improve on the rule-based quick filters (and for the rest of the config file parameters)
+- [ ] AI-assisted NPV parameter selection based on ticker statistics and sector benchmarks
+- [ ] Automatic screening / Optimal Portfolio Selection
+- [ ] Agentic control interface — allow an AI agent to drive the program (research the available methods)
 
 ## Disclaimer
 
