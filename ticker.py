@@ -38,6 +38,33 @@ cache_file_name = "{symbol}-{market}.pkl"
 forcast_growth_field = PORTFOLIO_CONFIG["forecast_growth_field"]
 
 
+# --- DCF model persistence ---
+_DCF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dcf_models")
+
+def save_dcf_model(symbol: str, market: str, **kwargs):
+    """Save DCF parameters for a ticker to dcf_models/.
+    Note: discount_rate_percent is saved for UI pre-fill only — it is NOT used
+    in IRR/intrinsic value calculations (those pass the rate explicitly)."""
+    os.makedirs(_DCF_DIR, exist_ok=True)
+    data = {"symbol": symbol.upper(), "market": market.upper(),
+            "saved_at": datetime.date.today().isoformat(), **kwargs}
+    path = os.path.join(_DCF_DIR, f"{symbol.upper()}-{market.upper()}.json")
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2)
+
+def load_dcf_model(symbol: str, market: str) -> dict | None:
+    """Load saved DCF parameters. Returns None if not found."""
+    path = os.path.join(_DCF_DIR, f"{symbol.upper()}-{market.upper()}.json")
+    if not os.path.isfile(path):
+        return None
+    with open(path, "r") as f:
+        return json.load(f)
+
+def dcf_remaining_growth_years(model: dict) -> float:
+    end = datetime.date.fromisoformat(model["growth_phase_end"])
+    return max((end - datetime.date.today()).days / 365.25, 0)
+
+
 class MarketDataCache:
     """Caches risk-free rate (^TNX) and S&P500 1yr return with a 1-hour TTL."""
     _TTL = 3600
@@ -297,10 +324,32 @@ class FundamentalMixin:
         return self.get_current_price() / forecasted_eps
 
     def _build_dcf_from_plot_data(self, growth_rate=None, **kwargs):
-        """Build a DCF model from _get_plot_data. Returns (calc_npv, price) or (None, None)."""
+        """Build a DCF model from _get_plot_data. Returns (calc_npv, price) or (None, None).
+        If a saved DCF model exists and no explicit parameters are passed, uses saved parameters."""
         data = self._get_plot_data()
         if data is None:
             return None, None
+
+        # Apply saved DCF model only when no explicit parameters are passed.
+        # Callers with explicit args (e.g. linear IRR, NPV calculator) bypass this.
+        if growth_rate is None and not kwargs:
+            model = getattr(self, 'dcf_model', None)
+            if model:
+                remaining_years = dcf_remaining_growth_years(model)
+                if remaining_years <= 0:
+                    print(f"Warning: {getattr(self, 'symbol', '?')} saved DCF model growth phase has ended")
+                days_since_save = (datetime.date.today() - datetime.date.fromisoformat(model["saved_at"])).days
+                if days_since_save > 180:
+                    print(f"Warning: {getattr(self, 'symbol', '?')} DCF model is {days_since_save} days old, consider updating")
+                growth_rate = model["growth_rate_percent"]
+                kwargs = {
+                    "short_term_is_linear": (model["growth_trend"] == "Linear"),
+                    "add_bv": model["add_book_value"],
+                    "short_term_growth_duration": remaining_years,
+                    "long_term_growth_duration": 0 if model["terminal_model"] == "Nothing" else -1,
+                    "maximal_long_term_growth_rate": model["terminal_growth_percent"] / 100 if model["terminal_model"] == "Slow Exponent" else 0,
+                }
+
         gr = growth_rate if growth_rate is not None else self.get_growth_rate("eps")
         if np.isnan(gr):
             return None, None
@@ -858,6 +907,7 @@ class Ticker(FundamentalMixin):
     def post_pickle(self, yf_ticker=None):
         self.yahoo_info.post_pickle(yf_ticker)
         self.reports.post_pickle(self.yahoo_info.yf_ticker)
+        self.dcf_model = load_dcf_model(self.symbol, self.market)
         return self
 
     def save_cache(self):
@@ -943,11 +993,13 @@ class Ticker(FundamentalMixin):
             "eps": None,
             "book_value": None,
             "updated at": None,
-            "TTM": None
+            "TTM": None,
+            "dcf_model_date": self.dcf_model.get("saved_at") if self.dcf_model else None
         }
 
         # allow __calculate_stats to log warning in this file
         self.warnings = list()
+        self.dcf_model = load_dcf_model(self.symbol, self.market)
         try:
             self.__calculate_stats()
         except Exception as err:

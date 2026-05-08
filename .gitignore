@@ -19,9 +19,12 @@ msn_reports/
 tickers_cache/
 
 # Output files
-output.csv
 *.csv
 *.xlsx
 *.png
 !images/*.png
+
 inputs/my_stocks.txt
+
+# DCF models (user-specific)
+dcf_models/

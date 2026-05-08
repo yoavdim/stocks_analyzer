@@ -48,7 +48,7 @@ class GrowthApp(QWidget):
         return radio_group
 
     def initUI(self):
-        self.setWindowTitle("Growth Parameters")
+        self.setWindowTitle(f"{self.ticker.symbol}:{self.ticker.market}")
 
         # top-level horizontal split: plot on left, controls on right
         root_layout = QHBoxLayout()
@@ -130,7 +130,61 @@ class GrowthApp(QWidget):
         self.controls_layout.addWidget(self.go_button)
         self.go_button.clicked.connect(self.handle_go_press)
 
+        # Save Button
+        self.save_button = QPushButton("Save DCF Model")
+        self.controls_layout.addWidget(self.save_button)
+        self.save_button.clicked.connect(self.handle_save)
+
         self.controls_layout.addStretch()
+
+        # Pre-fill from saved model if available
+        self._load_saved_model()
+
+    def _load_saved_model(self):
+        """Pre-fill fields from saved DCF model if one exists for this ticker."""
+        model = getattr(self.ticker, 'dcf_model', None)
+        if not model:
+            return
+
+        # Show indicator
+        saved_at = model.get("saved_at", "?")
+        benchmark = model.get("growth_benchmark", "?")
+        self.result_label.setText(f"Saved model ({saved_at}, {benchmark})")
+
+        # Growth rate — always load as Custom with the saved rate
+        for btn in self.growth_benchmark_group.buttons():
+            if btn.text() == "Custom":
+                btn.setChecked(True)
+                break
+        self.custom_growth_input.setText(str(model["growth_rate_percent"]))
+
+        # Growth trend
+        trend = model.get("growth_trend", "")
+        for btn in self.trend_group.buttons():
+            if btn.text() == trend:
+                btn.setChecked(True)
+                break
+
+        # Growth time (remaining years from target date)
+        from ticker import dcf_remaining_growth_years
+        remaining = dcf_remaining_growth_years(model)
+        self.growth_time_input.setText(str(max(1, round(remaining))))
+
+        # Terminal model
+        terminal = model.get("terminal_model", "")
+        for btn in self.perpetuity_group.buttons():
+            if btn.text() == terminal:
+                btn.setChecked(True)
+                break
+
+        # Terminal growth
+        self.perpetuity_growth_input.setText(str(model.get("terminal_growth_percent", 2.0)))
+
+        # Discount rate
+        self.discount_rate_input.setText(str(model.get("discount_rate_percent", 10.0)))
+
+        # Add book value
+        self.add_bv_checkbox.setChecked(model.get("add_book_value", True))
 
     def handle_go_press(self):
         benchmark = self.growth_benchmark_group.checkedButton().text()
@@ -186,6 +240,45 @@ class GrowthApp(QWidget):
 
         self.result_label.setText(
             "Growth: {}\nPrice Target: {:.2f}\nIRR: {:.2f}%".format(growth_str, price_target, iir))
+
+    def handle_save(self):
+        import datetime
+        from ticker import save_dcf_model
+
+        benchmark = self.growth_benchmark_group.checkedButton().text()
+        stats = self.ticker.statistics
+
+        if benchmark == "Custom":
+            growth_rate = float(self.custom_growth_input.text())
+        elif benchmark == "Book Value":
+            growth_rate = stats["bv_growth_rate"]
+        elif benchmark == "Earnings":
+            growth_rate = stats["growth_rate"]
+        elif benchmark == "Revenue":
+            growth_rate = stats["revenue_growth_rate"]
+        else:
+            growth_rate = stats.get("growth_rate", 0)
+
+        growth_years = int(self.growth_time_input.text())
+        growth_phase_end = (datetime.date.today() + datetime.timedelta(days=int(growth_years * 365.25))).isoformat()
+
+        save_dcf_model(
+            symbol=self.ticker.symbol,
+            market=self.ticker.market,
+            growth_rate_percent=growth_rate,
+            growth_benchmark=benchmark,
+            growth_trend=self.trend_group.checkedButton().text(),
+            growth_phase_end=growth_phase_end,
+            terminal_growth_percent=float(self.perpetuity_growth_input.text()),
+            terminal_model=self.perpetuity_group.checkedButton().text(),
+            discount_rate_percent=float(self.discount_rate_input.text()),
+            add_book_value=self.add_bv_checkbox.isChecked(),
+            last_report_date=str(stats.get("updated at", "")),
+        )
+        self.result_label.setText(f"Saved DCF model for {self.ticker.symbol}:{self.ticker.market}")
+        # Update in-memory model so reopening the NPV calculator reflects the save
+        from ticker import load_dcf_model
+        self.ticker.dcf_model = load_dcf_model(self.ticker.symbol, self.ticker.market)
 
 
 def main():
