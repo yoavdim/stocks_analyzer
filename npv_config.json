@@ -41,5 +41,42 @@
         "healthy",
         "overvalued",
         "leveraged"
-    ]
+    ],
+    "quick_filters": {
+        "healthy": {
+            "logic": "and",
+            "conditions": [
+                ["eps", ">", 0],
+                ["book_value", ">", 0],
+                ["earnings_yearly_trend", ">", 0],
+                ["equity_yearly_trend", ">", 0],
+                ["operating_cf_yearly_trend", ">", 0],
+                ["revenues_yearly_trend", ">", 0],
+                ["minimal_operating_cf", ">", 0],
+                ["roe[%]", ">=", 10],
+                ["roa[%]", ">=", 3],
+                ["growth_rate", ">=", 2.5],
+                ["bv_growth_rate", ">=", 2.5],
+                ["revenue_growth_rate", ">=", 1.7]
+            ]
+        },
+        "leveraged": {
+            "logic": "or",
+            "conditions": [
+                ["debt_to_equity", ">", 3.2],
+                ["non_operating_cf_yearly_trend", ">", 0],
+                ["maximal_non_operating_cf", ">", 0]
+            ]
+        },
+        "overvalued": {
+            "logic": "or",
+            "conditions": [
+                ["pe*bv", ">=", 100],
+                ["naive_time_to_profit", ">=", 20],
+                ["irr[%]", "<", 10],
+                ["basic_discount_ratio", "<", -10],
+                ["capm_discount_ratio", "<", -10]
+            ]
+        }
+    }
 }

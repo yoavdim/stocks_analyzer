@@ -30,6 +30,7 @@ with open(_config_path, "r") as _f:
     LINEAR_IRR_CONFIG = _config["linear_irr"]
     PORTFOLIO_CONFIG = _config["portfolio"]
     TLDR_FIELDS = _config.get("tldr_fields", [])
+    QUICK_FILTERS = _config.get("quick_filters", {})
 
 # Define:
 tickers_dir = "./tickers_cache"
@@ -876,40 +877,29 @@ class Ticker(FundamentalMixin):
             statistics["capm_discount_ratio"] = 100 * (statistics["capm_npv"] - stock_price) / stock_price
 
     def _calculate_quick_filter(self):
-        """ The function checks several conditions which determine if its a
-        ticker we're might be interested in. The conditions are split into two
-        categories:
-            - former: general health parameters which are more restrictive and
-              are enough to remove the ticker from buying considerations
-            - latter: parameters which might be changed later but might be an
-              indication for overvalued companies"""
+        """Evaluate quick filters from config. Each filter is a set of conditions
+        combined with 'and' or 'or' logic."""
+        import operator
+        ops = {">": operator.gt, "<": operator.lt, ">=": operator.ge,
+               "<=": operator.le, "==": operator.eq, "!=": operator.ne}
 
-        self.statistics["healthy"] = (self.statistics["eps"] > 0 and
-                                      self.statistics["book_value"] > 0 and
-                                      self.statistics["earnings_yearly_trend"] > 0 and
-                                      self.statistics["equity_yearly_trend"] > 0 and
-                                      self.statistics["operating_cf_yearly_trend"] > 0 and
-                                      self.statistics["revenues_yearly_trend"] > 0 and
-                                      self.statistics["minimal_operating_cf"] > 0 and
-                                      self.statistics["roe[%]"] >= 10 and
-                                      self.statistics["roa[%]"] >= 3 and
-                                      self.statistics["growth_rate"] >= 2.5 and
-                                      self.statistics["bv_growth_rate"] >= 2.5 and
-                                      self.statistics["revenue_growth_rate"] >= 1.7
-                                      )
+        for filter_name, filter_def in QUICK_FILTERS.items():
+            logic = filter_def["logic"]  # "and" or "or"
+            results = []
+            for stat_name, op_str, value in filter_def["conditions"]:
+                stat_val = self.statistics.get(stat_name)
+                if stat_val is None:
+                    results.append(False if logic == "and" else False)
+                    continue
+                try:
+                    results.append(ops[op_str](stat_val, value))
+                except (TypeError, ValueError):
+                    results.append(False)
 
-        self.statistics["leveraged"] = (self.statistics["debt_to_equity"] > 3.2 or
-                                        self.statistics["non_operating_cf_yearly_trend"] > 0 or
-                                        self.statistics["maximal_non_operating_cf"] > 0  # too restrictive
-                                        )
-
-        self.statistics["overvalued"] = (self.statistics["pe*bv"] >= 100 or
-                                         self.statistics["naive_time_to_profit"] >= 20 or
-                                         self.statistics["irr[%]"] < 10 or
-                                         self.statistics["basic_discount_ratio"] < -10 or
-                                         self.statistics["capm_discount_ratio"]  < -10
-                                         )
-        # TODO: add a current ratio metric for credit obligations?
+            if logic == "and":
+                self.statistics[filter_name] = all(results)
+            else:
+                self.statistics[filter_name] = any(results)
 
 
     @staticmethod
