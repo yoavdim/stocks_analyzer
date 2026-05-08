@@ -24,7 +24,7 @@ _INFO_PRICE_FIELDS = {
     "fiftyTwoWeekHigh", "fiftyTwoWeekLow", "fiftyDayAverage",
     "twoHundredDayAverage", "regularMarketDayHigh", "regularMarketDayLow",
     "regularMarketOpen", "regularMarketPreviousClose",
-    "bookValue", "priceToBook", "currentPrice",
+    "bookValue", "currentPrice",
     "targetHighPrice", "targetLowPrice", "targetMeanPrice", "targetMedianPrice",
     "totalCash", "totalDebt", "totalRevenue", "grossProfits",
     "ebitda", "operatingCashflow", "freeCashflow", "revenue",
@@ -33,7 +33,7 @@ _INFO_PRICE_FIELDS = {
 
 # Fields that are per-share and should be converted
 _INFO_PER_SHARE_FIELDS = {
-    "trailingEps", "forwardEps", "dividendRate", "fiveYearAvgDividendYield",
+    "trailingEps", "forwardEps", "dividendRate",
     "revenuePerShare", "totalCashPerShare",
 }
 
@@ -45,6 +45,9 @@ _SUB_UNIT_CURRENCIES = {
     "ILA": ("ILS", 100.0),  # Israeli agora = ILS / 100
     "GBX": ("GBP", 100.0),  # British pence = GBP / 100
 }
+
+# Row labels in financial statements that are NOT monetary (should not be converted)
+_NON_MONETARY_KEYWORDS = {"share", "ratio", "percent", "eps", "per share", "number", "outstanding"}
 
 
 class FxConverter:
@@ -86,7 +89,7 @@ class FxConverter:
             self._current_rates[currency] = (rate, time.time())
             return rate
         except Exception as e:
-            print(f"FX: failed to get rate for {currency}: {e}")
+            print(f"FX WARNING: failed to get rate for {currency}, using 1.0 (no conversion): {e}")
             return 1.0
 
     def _fetch_current_rate(self, currency: str) -> float:
@@ -164,7 +167,7 @@ class FxConverter:
             self._history_cache[currency] = hist
             return hist
         except Exception as e:
-            print(f"FX: failed to get history for {currency}->{self.base_currency}: {e}")
+            print(f"FX WARNING: failed to get history for {currency}->{self.base_currency}, prices will not be converted: {e}")
             self._history_cache[currency] = pd.Series(dtype=float)
             return self._history_cache[currency]
 
@@ -190,7 +193,13 @@ class YfTickerUSD:
             self._inner = yf.Ticker(ticker)
         else:
             self._inner = ticker
+        self._price_currency = None
+        self._financial_currency = None
 
+    def _detect_currencies(self):
+        """Lazily detect currencies on first access that needs them."""
+        if self._price_currency is not None:
+            return
         try:
             raw_info = self._inner.info
             self._price_currency = (raw_info.get("currency") or _BASE_CURRENCY).upper()
@@ -202,6 +211,7 @@ class YfTickerUSD:
     @property
     def info(self) -> dict:
         """Return .info with price/monetary fields converted to base currency."""
+        self._detect_currencies()
         raw = self._inner.info
         if self._price_currency == _BASE_CURRENCY:
             return raw
@@ -219,6 +229,7 @@ class YfTickerUSD:
 
     def history(self, *args, **kwargs) -> pd.DataFrame:
         """Return price history converted to base currency with tz-naive normalized index."""
+        self._detect_currencies()
         df = self._inner.history(*args, **kwargs)
         if df.empty:
             return df
@@ -238,13 +249,18 @@ class YfTickerUSD:
         return df
 
     def _convert_financial_df(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Convert a financial statement DataFrame to base currency."""
+        """Convert a financial statement DataFrame to base currency.
+        Skips non-monetary rows (shares, ratios, etc.)."""
+        self._detect_currencies()
         if df is None or df.empty or self._financial_currency == _BASE_CURRENCY:
             return df
         df = df.copy()
         for col in df.columns:
             rate = fx_converter.get_rate_at(self._financial_currency, col)
-            df[col] = df[col] * rate
+            for row_label in df.index:
+                if any(kw in row_label.lower() for kw in _NON_MONETARY_KEYWORDS):
+                    continue
+                df.at[row_label, col] = df.at[row_label, col] * rate
         return df
 
     @property
@@ -284,16 +300,20 @@ class YfTickersUSD:
         else:
             self._inner = tickers
 
-        # Build currency map and wrapped tickers
+        # Wrap individual tickers (currency detection is lazy per-ticker)
+        self._wrapped_tickers = {
+            symbol: YfTickerUSD(ticker)
+            for symbol, ticker in self._inner.tickers.items()
+        }
+        self._currencies = None  # lazily built
+
+    def _detect_currencies(self):
+        if self._currencies is not None:
+            return
         self._currencies = {}
-        self._wrapped_tickers = {}
-        for symbol, ticker in self._inner.tickers.items():
-            try:
-                currency = (ticker.info.get("currency") or _BASE_CURRENCY).upper()
-            except Exception:
-                currency = _BASE_CURRENCY
-            self._currencies[symbol] = currency
-            self._wrapped_tickers[symbol] = YfTickerUSD(ticker)
+        for symbol, wrapped in self._wrapped_tickers.items():
+            wrapped._detect_currencies()
+            self._currencies[symbol] = wrapped._price_currency
 
     @property
     def tickers(self) -> dict:
@@ -301,6 +321,7 @@ class YfTickersUSD:
 
     def history(self, *args, **kwargs) -> pd.DataFrame:
         """Return bulk price history converted to base currency with tz-naive normalized index."""
+        self._detect_currencies()
         df = self._inner.history(*args, **kwargs)
         if df.empty:
             return df
