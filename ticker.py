@@ -149,24 +149,51 @@ def get_exception_line():
 
 def search_growth(npv_function, price, min_growth,
                   max_growth=NPV_ASSUMPTIONS["irr_search_max"],
-                  delta_growth=NPV_ASSUMPTIONS["irr_search_step_percent"]/100):
+                  delta_growth=NPV_ASSUMPTIONS["irr_search_step_percent"]/100,
+                  monotone=False):
     """
-    find the iir/growth from the discounted value
-    :param npv_function: function which receive the guessed growth and return  the npv (assume monothonic one)
-    :param price:
-    :param min_groth:
-    :param min_growth:
-    :param max_growth:
-    :param delta_growth:
-    :return:
+    Find the IRR/growth rate where npv_function(rate) == price.
+    :param npv_function: function(growth_rate) -> npv value
+    :param price: target value to match
+    :param min_growth: lower bound of search range
+    :param max_growth: upper bound of search range
+    :param delta_growth: step size for linear scan / tolerance for bisection
+    :param monotone: if True, use binary search (assumes npv is monotonically decreasing with rate)
+    :return: IRR in percent
     """
-    # calculate the intrinsic rate of return (by dcf model):
-    # iteration parameters
+    if monotone:
+        irr = _bisect_search(npv_function, price, min_growth, max_growth, delta_growth)
+        if not np.isnan(irr):
+            return irr
+        # Fallback to linear scan if bisection failed
+
+    return _linear_search(npv_function, price, min_growth, max_growth, delta_growth)
+
+
+def _bisect_search(npv_function, price, lo, hi, tol):
+    """Find the rate where npv_function(rate) == price using scipy's Brent method."""
+    from scipy.optimize import brentq
+
+    def f(rate):
+        with np.errstate(all='ignore'):
+            v = npv_function(rate)
+        if v is None or np.isnan(v):
+            raise ValueError
+        if not np.isfinite(v):
+            v = np.sign(v) * 1e18
+        return v - price
+
+    try:
+        return brentq(f, lo, hi, xtol=tol) * 100
+    except (ValueError, RuntimeError):
+        return np.nan
+
+
+def _linear_search(npv_function, price, min_growth, max_growth, delta_growth):
+    """Original linear scan search."""
     best_result = None
     best_growth = np.nan
-    #plt.figure()
-    skipped = 0
-    for growth in range(0, int(1 + (max_growth-min_growth) / delta_growth)):  # todo: move to binary search
+    for growth in range(0, int(1 + (max_growth - min_growth) / delta_growth)):
         growth = delta_growth * growth + min_growth
         try:
             with warnings.catch_warnings(record=True) as w:
@@ -176,10 +203,8 @@ def search_growth(npv_function, price, min_growth,
         except Exception:
             npv = np.nan
         if npv is None or np.isnan(npv) or not np.isfinite(npv):
-            skipped += 1
             continue
         error = np.abs(npv - price)
-        #plt.scatter([growth], [npv - price])
         if (best_result is None) or error < best_result:
             best_result = error
             best_growth = growth
@@ -380,17 +405,25 @@ class FundamentalMixin:
                 avg_fcf = np.mean(data.get("free_cf_ps", data["free_cf"]))
                 avg_eps = np.mean(data["eps"])
                 eps_slope = self.get_growth_rate("eps", linear=True)
+                linear_growth = eps_slope * avg_fcf / avg_eps if avg_eps != 0 else 0
                 calc_npv, price = self._build_dcf_from_plot_data(
                     short_term_is_linear=True,
-                    linear_growth=eps_slope * avg_fcf / avg_eps if avg_eps != 0 else 0,
+                    linear_growth=linear_growth,
                     long_term_growth_duration=LINEAR_IRR_CONFIG["long_term_growth_duration"],
                     short_term_growth_duration=LINEAR_IRR_CONFIG["short_term_growth_duration"],
                 )
+                # Monotone if FCF positive and linear growth is non-decreasing
+                is_monotone = avg_fcf > 0 and linear_growth >= 0
             else:
                 calc_npv, price = self._build_dcf_from_plot_data()
+                # Monotone if FCF positive (exponential growth preserves sign)
+                data = self._get_plot_data()
+                avg_fcf = np.mean(data.get("free_cf_ps", data["free_cf"])) if data else 0
+                is_monotone = avg_fcf > 0
             if calc_npv is None:
                 return np.nan
-            return search_growth(calc_npv, price, min_growth=NPV_ASSUMPTIONS["irr_search_min"])
+            return search_growth(calc_npv, price, min_growth=NPV_ASSUMPTIONS["irr_search_min"],
+                                 monotone=is_monotone)
         except Exception as e:
             print(f"IRR calculation failed: {e}")
             return np.nan
