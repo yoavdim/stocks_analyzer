@@ -8,6 +8,7 @@ import os
 import json
 from pypfopt.risk_models import fix_nonpositive_semidefinite, CovarianceShrinkage
 from fx_converter import YfTickerUSD, YfTickersUSD
+from tase_adapter import is_tase_fund, TaseTickerUSD, TaseTickersUSD
 
 _config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "npv_config.json")
 with open(_config_path, "r") as _f:
@@ -128,7 +129,12 @@ class YahooInfo:
 
     def __init__(self, symbol, market, *, yf_info = None):
         self.full_symbol, self.market_endian = get_ticker_from_standard_symbols(symbol, market)
-        self.yf_ticker = yf_info if yf_info else YfTickerUSD(self.full_symbol)
+        if yf_info:
+            self.yf_ticker = yf_info
+        elif is_tase_fund(symbol, market):
+            self.yf_ticker = TaseTickerUSD(symbol)
+        else:
+            self.yf_ticker = YfTickerUSD(self.full_symbol)
         try:
             self.info = self.yf_ticker.info
             self.stock_prices = dict()
@@ -144,9 +150,23 @@ class YahooGroup:
         self.markets = markets
         self.history = None
         self.full_symbols = list()
+
+        yahoo_full_symbols = []
+        tase_tickers = {}
+
         for i in range(len(symbols)):
-            self.full_symbols.append(get_ticker_from_standard_symbols(symbols[i], markets[i])[0])
-        self.yf_ticker = YfTickersUSD(yf.Tickers(" ".join(self.full_symbols)))
+            full_sym = get_ticker_from_standard_symbols(symbols[i], markets[i])[0]
+            self.full_symbols.append(full_sym)
+            if is_tase_fund(symbols[i], markets[i]):
+                tase_tickers[full_sym] = TaseTickerUSD(symbols[i])
+            else:
+                yahoo_full_symbols.append(full_sym)
+
+        if tase_tickers:
+            inner_yf = YfTickersUSD(yf.Tickers(" ".join(yahoo_full_symbols))) if yahoo_full_symbols else None
+            self.yf_ticker = TaseTickersUSD(inner_yf, tase_tickers)
+        else:
+            self.yf_ticker = YfTickersUSD(yf.Tickers(" ".join(self.full_symbols)))
 
     def calculate_correlation(self):
         self.get_monthly_prices()
