@@ -12,6 +12,52 @@ from PyQt5.QtCore import Qt
 from ticker import Ticker, TickerGroup, FundamentalMixin, market_data
 
 
+def allocate_portfolio(method: str, symbols: list, markets: list, prices: list,
+                       market_caps: list, total_value: float):
+    """Compute weights and run DiscreteAllocation.greedy_portfolio in one step.
+
+    All inputs are pre-filtered parallel lists (no None / zero entries).
+    market_caps is only used when method == "market_cap"; pass None otherwise.
+
+    Returns (out_symbols, out_markets, out_quantities) or None if no shares allocated.
+    """
+    from pypfopt.discrete_allocation import DiscreteAllocation
+
+    n = len(symbols)
+    if method == "equal":
+        weights = np.ones(n) / n
+    elif method == "market_cap":
+        caps = np.array(market_caps, dtype=float)
+        total_cap = caps.sum()
+        if total_cap <= 0:
+            return None
+        weights = caps / total_cap
+    else:
+        raise ValueError(f"Unknown weighting method: {method}")
+
+    # DiscreteAllocation needs per-asset string keys; use "SYM:MKT" so we can map back.
+    keys = [f"{s}:{m}" for s, m in zip(symbols, markets)]
+    weights_dict = dict(zip(keys, weights))
+    latest_prices = pd.Series(dict(zip(keys, prices)))
+
+    da = DiscreteAllocation(weights_dict, latest_prices, total_portfolio_value=total_value)
+    allocation, leftover = da.greedy_portfolio()
+
+    print(f"\n{method} Allocation (Total: ${total_value:.2f}, Leftover: ${leftover:.2f}):")
+    key_to_info = dict(zip(keys, zip(symbols, markets, prices)))
+    out_symbols, out_markets, out_quantities = [], [], []
+    for key, quantity in allocation.items():
+        sym, mkt, price = key_to_info[key]
+        out_symbols.append(sym)
+        out_markets.append(mkt)
+        out_quantities.append(quantity)
+        print(f"  {sym}: {quantity} shares @ ${price:.2f} = ${quantity * price:.2f}")
+
+    if not out_symbols:
+        return None
+    return out_symbols, out_markets, out_quantities
+
+
 class Portfolio(TickerGroup, FundamentalMixin):
     """
     Used to predict future growth and volatility.
@@ -548,53 +594,52 @@ class PortfolioGui(QWidget):
             from ticker import is_stock
 
             p = self._portfolio
-            # Build full_symbol -> (symbol, market, price) mapping from the existing parallel lists
-            full_to_info = {}
+            total_value = sum(q * pr for q, pr in zip(p.quantities, p.current_prices))
+            if total_value <= 0:
+                total_value = 100_000
+
+            # TODO: revisit — do we actually need to ban ETFs/indices from EF outputs?
+            # The motivation was to avoid the optimizer collapsing onto SPY-like assets,
+            # but a user who included those tickers presumably wants them considered.
+            # Filter to stocks with positive price that have weight > 0
+            symbols, markets, full_symbols, prices = [], [], [], []
             for sym, mkt, fsym, price in zip(p.symbols, p.markets, p.full_symbols, p.current_prices):
-                if is_stock(p.yf_ticker.tickers[fsym]) and price and price > 0:
-                    full_to_info[fsym] = (sym, mkt, price)
+                w = target_weights.get(fsym, 0)
+                if w > 0 and price and price > 0 and is_stock(p.yf_ticker.tickers[fsym]):
+                    symbols.append(sym)
+                    markets.append(mkt)
+                    full_symbols.append(fsym)
+                    prices.append(price)
 
-            print(f"\n{title} Weights (before filtering):")
-            for fsym, weight in target_weights.items():
-                if weight > 0.001:
-                    print(f"  {fsym}: {weight*100:.2f}%")
-
-            # Filter to symbols we have prices for
-            filtered_weights = {k: v for k, v in target_weights.items() if k in full_to_info}
-            if not filtered_weights:
+            if not symbols:
                 print("Error: No valid investable assets found")
                 return
 
-            # Renormalize weights
-            total_weight = sum(filtered_weights.values())
-            if total_weight > 0:
-                filtered_weights = {k: v / total_weight for k, v in filtered_weights.items()}
+            # Renormalize weights for the filtered set
+            filtered_weights = {f: target_weights[f] for f in full_symbols}
+            total_w = sum(filtered_weights.values())
+            filtered_weights = {f: w / total_w for f, w in filtered_weights.items()}
 
-            latest_prices = pd.Series({k: full_to_info[k][2] for k in filtered_weights})
-
-            # Use total portfolio value if we have holdings, otherwise a default
-            total_value = sum(q * pr for q, pr in zip(p.quantities, p.current_prices))
-            if total_value <= 0:
-                total_value = 100_000  # default notional value for portfolios without holdings
-
+            latest_prices = pd.Series(dict(zip(full_symbols, prices)))
             da = DiscreteAllocation(filtered_weights, latest_prices, total_portfolio_value=total_value)
             allocation, leftover = da.greedy_portfolio()
 
             print(f"\n{title} Allocation (Total: ${total_value:.2f}, Leftover: ${leftover:.2f}):")
-            optimal_symbols, optimal_markets, optimal_quantities = [], [], []
+            fsym_to_info = dict(zip(full_symbols, zip(symbols, markets, prices)))
+            out_symbols, out_markets, out_quantities = [], [], []
             for fsym, quantity in allocation.items():
-                sym, mkt, price = full_to_info[fsym]
-                optimal_symbols.append(sym)
-                optimal_markets.append(mkt)
-                optimal_quantities.append(quantity)
+                sym, mkt, price = fsym_to_info[fsym]
+                out_symbols.append(sym)
+                out_markets.append(mkt)
+                out_quantities.append(quantity)
                 print(f"  {sym}: {quantity} shares @ ${price:.2f} = ${quantity * price:.2f}")
 
-            if not optimal_symbols:
+            if not out_symbols:
                 print("Error: No shares allocated")
                 return
 
             optimal_portfolio = Portfolio(
-                optimal_symbols, optimal_markets, optimal_quantities,
+                out_symbols, out_markets, out_quantities,
                 risk_free_rate=p.risk_free_rate,
                 existing_tickers=p.tickers_dictionary,
                 use_past_growth=p.use_past_growth

@@ -219,7 +219,35 @@ class YahooGroup:
         """Get the current stock price, or, if the market is closed, the closing price,
         without caching, as the price continue to change"""
         todays_data = self.yf_ticker.history(period='5d')
-        return todays_data['Close'].ffill().iloc[-1]
+        prices = todays_data['Close'].ffill().iloc[-1]
+        # yfinance returns columns sorted alphabetically; reindex 
+        return prices.reindex(self.full_symbols)
+
+    def get_market_caps(self, existing_tickers: dict = None) -> list:
+        """Return market caps aligned with self.full_symbols.
+
+        Reads cached Ticker.statistics["market_cap"] when available
+        (existing_tickers maps (symbol, market) -> Ticker), falling back to
+        yf_ticker.tickers[fsym].info.get("marketCap"). Missing values are None.
+        """
+        existing_tickers = existing_tickers or {}
+        caps = []
+        for sym, mkt, fsym in zip(self.symbols, self.markets, self.full_symbols):
+            mc = None
+            ticker = existing_tickers.get((sym, mkt))
+            if ticker is not None:
+                v = ticker.statistics.get("market_cap")
+                if v and not (isinstance(v, float) and np.isnan(v)):
+                    mc = v
+            if mc is None:
+                try:
+                    v = self.yf_ticker.tickers[fsym].info.get("marketCap")
+                    if v and not (isinstance(v, float) and np.isnan(v)):
+                        mc = v
+                except Exception as e:
+                    print(f"{fsym}: error reading marketCap ({e})")
+            caps.append(mc)
+        return caps
 
 
 
