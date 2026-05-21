@@ -66,6 +66,21 @@ def dcf_remaining_growth_years(model: dict) -> float:
     return max((end - datetime.date.today()).days / 365.25, 0)
 
 
+def compute_avg_fcf(plot_data: dict, basis: str) -> tuple[float, float]:
+    """Compute average free cash flow per share based on chosen basis.
+    basis: '4-year avg' (mean of last 4 annual reports, excluding TTM) or 'TTM' (most recent TTM value).
+    Returns (avg_fcf, years_behind_last_report) — the offset to roll forward to last_annual_date."""
+    fcf_series = plot_data.get("free_cf_ps", plot_data["free_cf"])
+    if basis == "TTM":
+        return fcf_series[-1], 0.0
+    # Exclude the TTM (last element) and take at most 4 annual reports
+    annual = fcf_series[:-1] if len(fcf_series) > 1 else fcf_series
+    annual = annual[-4:]  # at most 4 years
+    n = len(annual)
+    midpoint_offset = (n - 1) / 2
+    return np.mean(annual), midpoint_offset
+
+
 class MarketDataCache:
     """Caches risk-free rate (^TNX) and S&P500 1yr return with a 1-hour TTL."""
     _TTL = 3600
@@ -220,14 +235,13 @@ def _linear_search(npv_function, price, min_growth, max_growth, delta_growth):
     return irr
 
 
-def build_dcf_model(average_annual_free_cash_flow, book_value, diluted_shares, growth_rate_pct, last_annual_date,
+def build_dcf_model(average_annual_free_cash_flow, book_value, diluted_shares, growth, last_annual_date,
                     add_bv=NPV_ASSUMPTIONS["add_book_value"],
                     forward_to_present=NPV_ASSUMPTIONS["forward_to_present"],
                     short_term_is_linear=NPV_ASSUMPTIONS["short_term_is_linear"],
                     long_term_growth_duration=NPV_ASSUMPTIONS["long_term_growth_duration"],
                     short_term_growth_duration=NPV_ASSUMPTIONS["short_term_growth_duration"],
-                    maximal_long_term_growth_rate=NPV_ASSUMPTIONS["maximal_long_term_growth_rate_percent"]/100,
-                    linear_growth=0):
+                    maximal_long_term_growth_rate=NPV_ASSUMPTIONS["maximal_long_term_growth_rate_percent"]/100):
     """
     Build a DCF valuation model. Returns calc_npv(discount_rate) -> intrinsic value per unit.
 
@@ -236,15 +250,19 @@ def build_dcf_model(average_annual_free_cash_flow, book_value, diluted_shares, g
     average_annual_free_cash_flow : float — average annual free cash flow
     book_value : float — book value per unit (per-share for Ticker, total for Portfolio)
     diluted_shares : float — number of units to divide by (shares for Ticker, 1 for Portfolio)
-    growth_rate_pct : float — short-term growth rate in percent
+    growth : float — short-term growth. Interpretation depends on short_term_is_linear:
+        - False: percent compounding rate (e.g. 10 means 10%/yr)
+        - True:  absolute FCF increment per year (same units as average_annual_free_cash_flow)
     last_annual_date : datetime — date of last annual report (for forward_to_present)
-    linear_growth : float — annual linear FCF increment (only used when short_term_is_linear)
     """
-    forcasted_short_term_growth_rate = growth_rate_pct / 100
-    forcasted_long_term_growth_rate = np.min([maximal_long_term_growth_rate, forcasted_short_term_growth_rate])
-    # estimation for the first next cashflow (multiply in the growth rate once)
     if short_term_is_linear:
-        forcasted_long_term_growth_rate = maximal_long_term_growth_rate  # keep it independent of the log-regression
+        forcasted_short_term_growth_rate = 0  # unused in the linear short-term branch
+        linear_growth = growth
+        forcasted_long_term_growth_rate = maximal_long_term_growth_rate  # independent of short-term
+    else:
+        forcasted_short_term_growth_rate = growth / 100
+        linear_growth = 0
+        forcasted_long_term_growth_rate = np.min([maximal_long_term_growth_rate, forcasted_short_term_growth_rate])
 
     def calc_npv(discount_rate):
         assert discount_rate > -100E-2, "discontinuity at -1"
@@ -349,16 +367,18 @@ class FundamentalMixin:
             return np.nan
         return self.get_current_price() / forecasted_eps
 
-    def _build_dcf_from_plot_data(self, growth_rate=None, **kwargs):
+    def _build_dcf_from_plot_data(self, growth=None, avg_fcf=None, **kwargs):
         """Build a DCF model from _get_plot_data. Returns (calc_npv, price) or (None, None).
-        If a saved DCF model exists and no explicit parameters are passed, uses saved parameters."""
+        If a saved DCF model exists and no explicit parameters are passed, uses saved parameters.
+        `growth` interpretation matches build_dcf_model: percent in exponential mode,
+        absolute FCF/share/yr in linear mode (kwargs['short_term_is_linear'])."""
         data = self._get_plot_data()
         if data is None:
             return None, None
 
         # Apply saved DCF model only when no explicit parameters are passed.
         # Callers with explicit args (e.g. linear IRR, NPV calculator) bypass this.
-        if growth_rate is None and not kwargs:
+        if growth is None and avg_fcf is None and not kwargs:
             model = getattr(self, 'dcf_model', None)
             if model:
                 remaining_years = dcf_remaining_growth_years(model)
@@ -367,29 +387,38 @@ class FundamentalMixin:
                 days_since_save = (datetime.date.today() - datetime.date.fromisoformat(model["saved_at"])).days
                 if days_since_save > 180:
                     print(f"Warning: {getattr(self, 'symbol', '?')} DCF model is {days_since_save} days old, consider updating")
-                growth_rate = model["growth_rate_percent"]
+                is_linear = (model["growth_trend"] == "Linear")
+                growth = model["linear_growth"] if is_linear else model["growth_rate_percent"]
+                avg_fcf, fcf_offset = compute_avg_fcf(data, model["fcf_basis"])
+                # Roll avg_fcf forward to last_annual_date using the appropriate growth model
+                if fcf_offset > 0:
+                    if is_linear:
+                        avg_fcf += growth * fcf_offset
+                    else:
+                        avg_fcf *= (1 + growth / 100) ** fcf_offset
                 kwargs = {
-                    "short_term_is_linear": (model["growth_trend"] == "Linear"),
+                    "short_term_is_linear": is_linear,
                     "add_bv": model["add_book_value"],
                     "short_term_growth_duration": remaining_years,
                     "long_term_growth_duration": 0 if model["terminal_model"] == "Nothing" else -1,
                     "maximal_long_term_growth_rate": model["terminal_growth_percent"] / 100 if model["terminal_model"] == "Slow Exponent" else 0,
                 }
 
-        gr = growth_rate if growth_rate is not None else self.get_growth_rate("eps")
+        gr = growth if growth is not None else self.get_growth_rate("eps")
         if np.isnan(gr):
             return None, None
         price = self.get_current_price()
         if price <= 0:
             return None, None
 
-        avg_fcf = np.mean(data.get("free_cf_ps", data["free_cf"]))
+        if avg_fcf is None:
+            avg_fcf = np.mean(data.get("free_cf_ps", data["free_cf"]))
 
         calc_npv = build_dcf_model(
             average_annual_free_cash_flow=avg_fcf,
             book_value=data["bv"][-1] if len(data["bv"]) > 0 else 0,
             diluted_shares=1,
-            growth_rate_pct=gr,
+            growth=gr,
             last_annual_date=data["times"][-1] if data["times"] else datetime.datetime.now(),
             forward_to_present=True,
             **kwargs,
@@ -399,17 +428,23 @@ class FundamentalMixin:
     def get_irr(self, linear=False):
         """DCF-based IRR. If linear=True, uses linear growth model."""
         try:
+            data = self._get_plot_data()
+            if data is None:
+                return np.nan
+            # Use saved fcf basis if available, otherwise 4-year avg
+            model = getattr(self, 'dcf_model', None)
+            fcf_basis = model.get("fcf_basis", "4-year avg") if model else "4-year avg"
+            avg_fcf, _ = compute_avg_fcf(data, fcf_basis)
+            # Note: offset correction is handled inside _build_dcf_from_plot_data for the saved model path
+
             if linear:
-                data = self._get_plot_data()
-                if data is None:
-                    return np.nan
-                avg_fcf = np.mean(data.get("free_cf_ps", data["free_cf"]))
                 avg_eps = np.mean(data["eps"])
                 eps_slope = self.get_growth_rate("eps", linear=True)
                 linear_growth = eps_slope * avg_fcf / avg_eps if avg_eps != 0 else 0
                 calc_npv, price = self._build_dcf_from_plot_data(
+                    avg_fcf=avg_fcf,
                     short_term_is_linear=True,
-                    linear_growth=linear_growth,
+                    growth=linear_growth,
                     long_term_growth_duration=LINEAR_IRR_CONFIG["long_term_growth_duration"],
                     short_term_growth_duration=LINEAR_IRR_CONFIG["short_term_growth_duration"],
                 )
@@ -418,9 +453,11 @@ class FundamentalMixin:
             else:
                 calc_npv, price = self._build_dcf_from_plot_data()
                 # Monotone if FCF positive (exponential growth preserves sign)
-                data = self._get_plot_data()
-                avg_fcf = np.mean(data.get("free_cf_ps", data["free_cf"])) if data else 0
                 is_monotone = avg_fcf > 0
+            if calc_npv is None:
+                return np.nan
+            return search_growth(calc_npv, price, min_growth=NPV_ASSUMPTIONS["irr_search_min"],
+                                 monotone=is_monotone)
             if calc_npv is None:
                 return np.nan
             return search_growth(calc_npv, price, min_growth=NPV_ASSUMPTIONS["irr_search_min"],
@@ -723,25 +760,23 @@ class Ticker(FundamentalMixin):
         statistics = self.statistics
         years = Ticker.__calculate_year_diff(annual_dates)
 
-        # earnings trend (slope) (total, not per-stock)
-        yearly_earnings = [statement["Net Income"] for statement in all_yearly_income_statements]
-        poly_fit = Polynomial.fit(years, yearly_earnings, deg=1)
-        earnings_fit = poly_fit.convert().coef
-        statistics["earnings_yearly_trend"] = earnings_fit[1]  # keep the slope
+        # share count per year (used to compute per-share series)
+        shares = np.array([s["Diluted Weighted Average Shares"] for s in all_yearly_income_statements])
 
-        # earnings growth (exponential)
+        # earnings trend & growth (per-share — EPS)
+        yearly_eps = np.array([s["Net Income"] for s in all_yearly_income_statements]) / shares
+        poly_fit = Polynomial.fit(years, yearly_eps, deg=1)
+        statistics["earnings_yearly_trend"] = poly_fit.convert().coef[1]
+
         try:
-            earnings_ln = np.log(yearly_earnings)
-            poly_fit = Polynomial.fit(years, earnings_ln, deg=1)
-            earnings_ln_fit = poly_fit.coef
-            growth_rate = (np.exp(earnings_ln_fit[1]) - 1) * 100
+            poly_fit = Polynomial.fit(years, np.log(yearly_eps), deg=1)
+            growth_rate = (np.exp(poly_fit.convert().coef[1]) - 1) * 100
             statistics["growth_rate"] = growth_rate
-            # peg ratio
             statistics["peg_ratio"] = statistics["pe_ratio"] / growth_rate
         except RuntimeWarning as warn:
-            if yearly_earnings[0] > 0 and yearly_earnings[-1] > 0:
+            if yearly_eps[0] > 0 and yearly_eps[-1] > 0:
                 self.warnings.append("Failed to calculate log growth_rate. Growth rate fallback calculation")
-                growth_rate = (yearly_earnings[-1] / yearly_earnings[0]) ** (1 / years[-1])
+                growth_rate = (yearly_eps[-1] / yearly_eps[0]) ** (1 / years[-1])
                 growth_rate = (growth_rate - 1) * 100
                 statistics["growth_rate"] = growth_rate
                 statistics["peg_ratio"] = statistics["pe_ratio"] / growth_rate
@@ -750,40 +785,32 @@ class Ticker(FundamentalMixin):
                 statistics["growth_rate"] = float('NaN')
                 statistics["peg_ratio"] = float('NaN')
 
-        # revenues trend (total, not per-stock)
-        yearly_revenues = [statement["Total Revenue"] for statement in all_yearly_income_statements]
-        poly_fit = Polynomial.fit(years, yearly_revenues, deg=1)
-        revenues_fit = poly_fit.convert().coef
-        statistics["revenues_yearly_trend"] = revenues_fit[1]  # keep the slope
+        # revenue trend & growth (per-share)
+        yearly_revenue_ps = np.array([s["Total Revenue"] for s in all_yearly_income_statements]) / shares
+        poly_fit = Polynomial.fit(years, yearly_revenue_ps, deg=1)
+        statistics["revenues_yearly_trend"] = poly_fit.convert().coef[1]
 
-        # revenue growth
         try:
-            revenues_ln = np.log(yearly_revenues)
-            poly_fit = Polynomial.fit(years, revenues_ln, deg=1)
-            revenues_ln_fit = poly_fit.convert().coef
-            revenue_growth_rate = (np.exp(revenues_ln_fit[1]) - 1) * 100
+            poly_fit = Polynomial.fit(years, np.log(yearly_revenue_ps), deg=1)
+            revenue_growth_rate = (np.exp(poly_fit.convert().coef[1]) - 1) * 100
             statistics["revenue_growth_rate"] = revenue_growth_rate
-            # peg ratio
             statistics["peg_ratio"] = statistics["pe_ratio"] / revenue_growth_rate
         except RuntimeWarning as warn:
-            if yearly_revenues[0] > 0 and yearly_revenues[-1] > 0:
+            if yearly_revenue_ps[0] > 0 and yearly_revenue_ps[-1] > 0:
                 self.warnings.append("Failed to calculate log revenue_growth_rate. Growth rate fallback calculation")
-                revenue_growth_rate = (yearly_revenues[-1] / yearly_revenues[0]) ** (1 / years[-1])
+                revenue_growth_rate = (yearly_revenue_ps[-1] / yearly_revenue_ps[0]) ** (1 / years[-1])
                 revenue_growth_rate = (revenue_growth_rate - 1) * 100
                 statistics["revenue_growth_rate"] = revenue_growth_rate
             else:
                 self.warnings.append("Failed to calculate log revenue_growth_rate. Warning: {}".format(warn))
                 statistics["revenue_growth_rate"] = float('NaN')
 
-        # equity_trend (total, not per-stock)
-        yearly_equity = [sheet["Total Equity"] for sheet in all_yearly_balance_sheets]
-        poly_fit = Polynomial.fit(years, yearly_equity, deg=1)
-        equity_fit = poly_fit.convert().coef
-        statistics["equity_yearly_trend"] = equity_fit[1]  # keep the slope
+        # equity_trend (per-share — book value per share)
+        yearly_bv = np.array([s["Total Equity"] for s in all_yearly_balance_sheets]) / shares
+        poly_fit = Polynomial.fit(years, yearly_bv, deg=1)
+        statistics["equity_yearly_trend"] = poly_fit.convert().coef[1]
 
         # bv growth rate
-        shares = [statement["Diluted Weighted Average Shares"] for statement in all_yearly_income_statements]
-        yearly_bv = np.divide(yearly_equity, shares)
         try:
             equity_ln = np.log(yearly_bv)  # might throw
             poly_fit = Polynomial.fit(years, equity_ln, deg=1)
@@ -800,25 +827,36 @@ class Ticker(FundamentalMixin):
                 self.warnings.append("Failed to calculate log bv_growth_rate. Warning: {}".format(warn))
                 statistics["bv_growth_rate"] = float('NaN')
 
-        # operating cash flow trend
-        yearly_operating_cash_flow = np.array(
-            [flow["Cash Flow from Operating Activities"] for flow in all_yearly_cash_flows])
-        poly_fit = Polynomial.fit(years, yearly_operating_cash_flow, deg=1)
-        operating_cf_fit = poly_fit.convert().coef
-        statistics["operating_cf_yearly_trend"] = operating_cf_fit[1]  # keep the slope
+        # operating cash flow trend (per-share)
+        yearly_ocf_ps = np.array(
+            [flow["Cash Flow from Operating Activities"] for flow in all_yearly_cash_flows]) / shares
+        poly_fit = Polynomial.fit(years, yearly_ocf_ps, deg=1)
+        statistics["operating_cf_yearly_trend"] = poly_fit.convert().coef[1]
 
-        # minimal operating cf
-        statistics["minimal_operating_cf"] = np.min(yearly_operating_cash_flow)
+        # minimal operating cf (per-share)
+        statistics["minimal_operating_cf"] = np.min(yearly_ocf_ps)
 
-        # non operating cash flow trend
-        yearly_total_cash_flow = np.array([flow["Change in Cash"] for flow in all_yearly_cash_flows])
-        yearly_non_operating_cash_flow = yearly_total_cash_flow - yearly_operating_cash_flow
-        poly_fit = Polynomial.fit(years, yearly_non_operating_cash_flow, deg=1)
-        non_operating_cf_fit = poly_fit.convert().coef
-        statistics["non_operating_cf_yearly_trend"] = non_operating_cf_fit[1]  # keep the slope
+        # free cash flow trend & growth (per-share)
+        yearly_capex = np.array(
+            [flow["Purchase/Sale of Prop,Plant,Equip: Net"] for flow in all_yearly_cash_flows]) / shares
+        yearly_fcf_ps = yearly_ocf_ps + yearly_capex  # capex is negative
+        poly_fit = Polynomial.fit(years, yearly_fcf_ps, deg=1)
+        statistics["fcf_yearly_trend"] = poly_fit.convert().coef[1]
+        try:
+            poly_fit = Polynomial.fit(years, np.log(yearly_fcf_ps), deg=1)
+            statistics["fcf_growth_rate"] = (np.exp(poly_fit.convert().coef[1]) - 1) * 100
+        except (RuntimeWarning, FloatingPointError):
+            self.warnings.append("Failed to calculate log fcf_growth_rate (negative FCF in series)")
+            statistics["fcf_growth_rate"] = float('NaN')
 
-        # maximal non operating cf
-        statistics["maximal_non_operating_cf"] = np.max(yearly_non_operating_cash_flow)
+        # non operating cash flow trend (per-share)
+        yearly_total_cf_ps = np.array([flow["Change in Cash"] for flow in all_yearly_cash_flows]) / shares
+        yearly_non_op_cf_ps = yearly_total_cf_ps - yearly_ocf_ps
+        poly_fit = Polynomial.fit(years, yearly_non_op_cf_ps, deg=1)
+        statistics["non_operating_cf_yearly_trend"] = poly_fit.convert().coef[1]
+
+        # maximal non operating cf (per-share)
+        statistics["maximal_non_operating_cf"] = np.max(yearly_non_op_cf_ps)
 
     @staticmethod
     def __calculate_free_cash_flow(cashflow_statement):
@@ -838,7 +876,12 @@ class Ticker(FundamentalMixin):
     def get_growth_rate(self, field="eps", linear=False):
         """Return pre-computed growth rate from statistics if available."""
         if not linear:
-            field_map = {"eps": "growth_rate", "bv": "bv_growth_rate", "revenue_ps": "revenue_growth_rate"}
+            field_map = {
+                "eps": "growth_rate",
+                "bv": "bv_growth_rate",
+                "revenue_ps": "revenue_growth_rate",
+                "free_cf_ps": "fcf_growth_rate",
+            }
             stat_key = field_map.get(field)
             if stat_key and hasattr(self, 'statistics') and stat_key in self.statistics:
                 return self.statistics[stat_key]
@@ -1001,6 +1044,8 @@ class Ticker(FundamentalMixin):
             "growth_rate": None,
             "bv_growth_rate": None,
             "revenue_growth_rate": None,
+            "fcf_growth_rate": None,
+            "fcf_yearly_trend": None,
             "dividends": None,
             "owners_earnings": None,
             "actual_earnings": None,

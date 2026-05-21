@@ -7,7 +7,10 @@ from PyQt5.QtWidgets import (
 )
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.backends.backend_qt5agg import NavigationToolbar2QT as NavigationToolbar
-from ticker import Ticker
+from ticker import (
+    Ticker, market_data, compute_avg_fcf, dcf_remaining_growth_years,
+    save_dcf_model, load_dcf_model, search_growth, NPV_ASSUMPTIONS,
+)
 import json, os
 import numpy as np
 
@@ -82,11 +85,28 @@ class GrowthApp(QWidget):
         growth_time_layout.addWidget(self.growth_time_input)
         self.controls_layout.addLayout(growth_time_layout)
 
-        # Growth Benchmark Section
+        # FCF Basis — choose between 4-year average or TTM
+        from fx_converter import fx_converter
+        try:
+            data = self.ticker._get_plot_data()
+            avg_4y, _ = compute_avg_fcf(data, "4-year avg")
+            ttm, _ = compute_avg_fcf(data, "TTM")
+            currency = fx_converter.base_currency
+            fcf_names = [f"4-year avg ({avg_4y:.2f} {currency}/share)", f"TTM ({ttm:.2f} {currency}/share)"]
+        except Exception:
+            fcf_names = ["4-year avg", "TTM"]
+        self.fcf_basis_group = self._init_radio(prefix="FCF Basis:", names=fcf_names, horizontal=True)
+        self.fcf_basis_group.buttons()[0].setChecked(True)  # 4-year avg default
+
+        # Growth Benchmark Section — labels are mode-dependent (see _refresh_benchmark_labels)
         self.custom_growth_input = QLineEdit()
         self.growth_benchmark_group = self._init_radio(prefix="Growth Benchmark:", text_box=self.custom_growth_input,
                                                        names=["Earnings", "Book Value", "Revenue", "FCF", "Custom"])
         self.growth_benchmark_group.buttons()[0].setChecked(True)
+        # Refresh labels now that all controls exist
+        self._refresh_benchmark_labels()
+        # React to trend changes (Linear/Exponential)
+        self.trend_group.buttonClicked.connect(self._refresh_benchmark_labels)
 
         # Perpetuity Growth Section
         self.perpetuity_growth_input = QLineEdit(str(NPV_CALCULATOR_CONFIG["default_perpetuity_growth_percent"]))
@@ -103,7 +123,6 @@ class GrowthApp(QWidget):
 
         # CAPM info
         try:
-            from ticker import market_data
             rfr = market_data.get_risk_free_rate() * 100
             mkt = market_data.get_market_return() * 100
             beta = self.ticker.statistics.get("beta")
@@ -151,12 +170,16 @@ class GrowthApp(QWidget):
         benchmark = model.get("growth_benchmark", "?")
         self.result_label.setText(f"Saved model ({saved_at}, {benchmark})")
 
-        # Growth rate — always load as Custom with the saved rate
+        # Growth rate — always load as Custom with the saved rate.
+        # In Linear trend, the Custom input shows the FCF $/share/yr slope,
+        # otherwise the compounding percent.
         for btn in self.growth_benchmark_group.buttons():
             if btn.text() == "Custom":
                 btn.setChecked(True)
                 break
-        self.custom_growth_input.setText(str(model["growth_rate_percent"]))
+        is_linear = model["growth_trend"] == "Linear"
+        custom_value = model["linear_growth"] if is_linear else model["growth_rate_percent"]
+        self.custom_growth_input.setText(str(custom_value))
 
         # Growth trend
         trend = model.get("growth_trend", "")
@@ -166,7 +189,6 @@ class GrowthApp(QWidget):
                 break
 
         # Growth time (remaining years from target date)
-        from ticker import dcf_remaining_growth_years
         remaining = dcf_remaining_growth_years(model)
         self.growth_time_input.setText(str(max(1, round(remaining))))
 
@@ -186,8 +208,87 @@ class GrowthApp(QWidget):
         # Add book value
         self.add_bv_checkbox.setChecked(model.get("add_book_value", True))
 
-    def handle_go_press(self):
-        benchmark = self.growth_benchmark_group.checkedButton().text()
+        # FCF basis
+        fcf_basis = model.get("fcf_basis", "4-year avg")
+        for btn in self.fcf_basis_group.buttons():
+            if btn.text().startswith(fcf_basis):
+                btn.setChecked(True)
+                break
+
+    def _get_benchmark_name(self) -> str:
+        """Extract canonical benchmark name (without growth percentage in parentheses)."""
+        text = self.growth_benchmark_group.checkedButton().text()
+        return text.split(" (")[0]
+
+    def _refresh_benchmark_labels(self):
+        """Update benchmark radio labels based on Linear/Exponential mode.
+        In Exponential: shows growth rate in %.
+        In Linear: shows the equivalent FCF slope ($/yr) after conversion."""
+        from fx_converter import fx_converter
+        is_linear = self.trend_group.checkedButton().text() == "Linear"
+        stats = self.ticker.statistics
+        currency = fx_converter.base_currency
+
+        if is_linear:
+            # Compute FCF-equivalent linear slopes
+            data = self.ticker._get_plot_data()
+            avg_fcf = np.mean(data.get("free_cf_ps", data["free_cf"]))
+
+            def _slope_to_fcf(field, avg_field_key):
+                slope = self.ticker.get_growth_rate(field, linear=True)
+                avg_field = np.mean(data[avg_field_key])
+                if np.isnan(slope) or avg_field == 0:
+                    return np.nan
+                return slope * avg_fcf / avg_field
+
+            slopes = {
+                "Earnings": _slope_to_fcf("eps", "eps"),
+                "Revenue":  _slope_to_fcf("revenue_ps", "revenue_ps"),
+                "FCF":      self.ticker.get_growth_rate("free_cf_ps", linear=True),  # already in FCF units
+            }
+
+            def _fmt_slope(s):
+                return f" ({s:.2f} {currency}/share/yr)" if not np.isnan(s) else ""
+
+            new_labels = {
+                "Earnings": f"Earnings{_fmt_slope(slopes['Earnings'])}",
+                "Book Value": "Book Value",  # hidden anyway
+                "Revenue": f"Revenue{_fmt_slope(slopes['Revenue'])}",
+                "FCF": f"FCF{_fmt_slope(slopes['FCF'])}",
+                "Custom": "Custom",
+            }
+        else:
+            def _fmt_pct(rate):
+                return f" ({rate:.1f}%)" if rate is not None and not np.isnan(rate) else ""
+
+            new_labels = {
+                "Earnings":   f"Earnings{_fmt_pct(stats.get('growth_rate'))}",
+                "Book Value": f"Book Value{_fmt_pct(stats.get('bv_growth_rate'))}",
+                "Revenue":    f"Revenue{_fmt_pct(stats.get('revenue_growth_rate'))}",
+                "FCF":        f"FCF{_fmt_pct(stats.get('fcf_growth_rate'))}",
+                "Custom":     "Custom",
+            }
+
+        # Apply: relabel + hide BV in linear mode
+        for btn in self.growth_benchmark_group.buttons():
+            canonical = btn.text().split(" (")[0]
+            btn.setText(new_labels.get(canonical, canonical))
+            if canonical == "Book Value":
+                btn.setVisible(not is_linear)
+                if is_linear and btn.isChecked():
+                    # Switch to Earnings if BV was selected
+                    self.growth_benchmark_group.buttons()[0].setChecked(True)
+
+    def _get_fcf_basis(self) -> str:
+        """Extract canonical FCF basis name."""
+        text = self.fcf_basis_group.checkedButton().text()
+        return text.split(" (")[0]
+
+    def _resolve_growth(self, benchmark, is_linear):
+        """Return (growth_rate_percent, linear_growth_per_share_per_year) for the chosen benchmark.
+        - growth_rate_percent: compounding rate in % (always meaningful, used for exp mode)
+        - linear_growth: absolute FCF $/share/yr (only meaningful in linear mode; 0 otherwise)
+        """
         stats = self.ticker.statistics
         if benchmark == "Book Value":
             growth_rate = stats["bv_growth_rate"]
@@ -196,18 +297,45 @@ class GrowthApp(QWidget):
         elif benchmark == "Revenue":
             growth_rate = stats["revenue_growth_rate"]
         elif benchmark == "FCF":
-            raise NotImplementedError("FCF growth rate is not yet tracked separately")
+            growth_rate = stats.get("fcf_growth_rate", float('nan'))
         else:  # Custom
             growth_rate = float(self.custom_growth_input.text())
 
+        linear_growth = 0
+        if is_linear:
+            data = self.ticker._get_plot_data()
+            avg_fcf = np.mean(data.get("free_cf_ps", data["free_cf"]))
+            if benchmark == "Custom":
+                # User-provided slope in FCF $/year
+                linear_growth = float(self.custom_growth_input.text())
+            else:
+                field_map = {"Earnings": ("eps", "eps"),
+                             "Revenue":  ("revenue_ps", "revenue_ps"),
+                             "FCF":      ("free_cf_ps", "free_cf_ps")}
+                field, avg_key = field_map[benchmark]
+                slope = self.ticker.get_growth_rate(field, linear=True)
+                avg_value = np.mean(data[avg_key])
+                linear_growth = slope * avg_fcf / avg_value if avg_value != 0 else 0
+
+        return growth_rate, linear_growth
+
+    def handle_go_press(self):
+        benchmark = self._get_benchmark_name()
         is_linear = self.trend_group.checkedButton().text() == "Linear"
 
-        if is_linear and benchmark != "Earnings":
-            raise NotImplementedError("Linear growth is only supported with Earnings benchmark")
+        # Block BV in linear mode (relationship to FCF is too indirect)
+        if is_linear and benchmark == "Book Value":
+            self.result_label.setText("Book Value not supported in linear mode")
+            return
+
+        growth_rate, linear_growth = self._resolve_growth(benchmark, is_linear)
+
+        # Pick the single growth value: linear slope or compounding percent
+        growth = linear_growth if is_linear else growth_rate
 
         args_iir = {
             "forward_to_present": True,
-            "growth_rate": growth_rate,
+            "growth": growth,
             "add_bv": self.add_bv_checkbox.isChecked(),
             "short_term_is_linear": is_linear,
             "long_term_growth_duration": 0 if self.perpetuity_group.checkedButton().text() == "Nothing" else -1,
@@ -216,8 +344,15 @@ class GrowthApp(QWidget):
         }
         print(args_iir)
         discount_rate = float(self.discount_rate_input.text()) / 100
+        avg_fcf, fcf_offset = compute_avg_fcf(self.ticker._get_plot_data(), self._get_fcf_basis())
+        if fcf_offset > 0:
+            if is_linear:
+                avg_fcf += linear_growth * fcf_offset
+            else:
+                avg_fcf *= (1 + growth_rate / 100) ** fcf_offset
         calc_npv, price = self.ticker._build_dcf_from_plot_data(
-            growth_rate=growth_rate,
+            growth=growth,
+            avg_fcf=avg_fcf,
             short_term_is_linear=is_linear,
             add_bv=args_iir["add_bv"],
             long_term_growth_duration=args_iir["long_term_growth_duration"],
@@ -227,14 +362,11 @@ class GrowthApp(QWidget):
         if calc_npv is None:
             self.result_label.setText("Cannot compute: insufficient data")
             return
-        from ticker import search_growth, NPV_ASSUMPTIONS
         price_target = calc_npv(discount_rate)
         iir = search_growth(calc_npv, price, min_growth=NPV_ASSUMPTIONS["irr_search_min"])
         print(iir)
-        is_linear = self.trend_group.checkedButton().text() == "Linear"
         if is_linear:
-            growth_str = "Linear (trend: {:.0f} $/yr)".format(
-                self.ticker.statistics["earnings_yearly_trend"])
+            growth_str = "Linear ({:.2f} {}/share/yr)".format(linear_growth, "USD")
         else:
             growth_str = "Exponential ({:.1f}%)".format(growth_rate)
 
@@ -243,21 +375,12 @@ class GrowthApp(QWidget):
 
     def handle_save(self):
         import datetime
-        from ticker import save_dcf_model
 
-        benchmark = self.growth_benchmark_group.checkedButton().text()
+        benchmark = self._get_benchmark_name()
+        is_linear = self.trend_group.checkedButton().text() == "Linear"
         stats = self.ticker.statistics
 
-        if benchmark == "Custom":
-            growth_rate = float(self.custom_growth_input.text())
-        elif benchmark == "Book Value":
-            growth_rate = stats["bv_growth_rate"]
-        elif benchmark == "Earnings":
-            growth_rate = stats["growth_rate"]
-        elif benchmark == "Revenue":
-            growth_rate = stats["revenue_growth_rate"]
-        else:
-            growth_rate = stats.get("growth_rate", 0)
+        growth_rate, linear_growth = self._resolve_growth(benchmark, is_linear)
 
         growth_years = int(self.growth_time_input.text())
         growth_phase_end = (datetime.date.today() + datetime.timedelta(days=int(growth_years * 365.25))).isoformat()
@@ -266,6 +389,7 @@ class GrowthApp(QWidget):
             symbol=self.ticker.symbol,
             market=self.ticker.market,
             growth_rate_percent=growth_rate,
+            linear_growth=linear_growth,
             growth_benchmark=benchmark,
             growth_trend=self.trend_group.checkedButton().text(),
             growth_phase_end=growth_phase_end,
@@ -273,11 +397,11 @@ class GrowthApp(QWidget):
             terminal_model=self.perpetuity_group.checkedButton().text(),
             discount_rate_percent=float(self.discount_rate_input.text()),
             add_book_value=self.add_bv_checkbox.isChecked(),
+            fcf_basis=self._get_fcf_basis(),
             last_report_date=str(stats.get("updated at", "")),
         )
         self.result_label.setText(f"Saved DCF model for {self.ticker.symbol}:{self.ticker.market}")
         # Update in-memory model so reopening the NPV calculator reflects the save
-        from ticker import load_dcf_model
         self.ticker.dcf_model = load_dcf_model(self.ticker.symbol, self.ticker.market)
 
 
