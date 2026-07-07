@@ -64,9 +64,9 @@ class Portfolio(TickerGroup, FundamentalMixin):
     Can show the efficient frontier and this portfolio plotted on it.
     """
     def __init__(self, symbols: list, markets: list, quantities: list, *,
-                 risk_free_rate=None, existing_tickers: dict = dict(), use_past_growth=False):
+                 risk_free_rate=None, existing_tickers: dict = dict(), forecast_policy):
         super().__init__(symbols, markets, risk_free_rate=risk_free_rate,
-                         existing_tickers=existing_tickers, use_past_growth=use_past_growth)
+                         existing_tickers=existing_tickers, forecast_policy=forecast_policy)
         self.current_prices = self.get_stock_prices_now()
         self.quantities = np.array(quantities)
         # Check if this is an actual portfolio with holdings
@@ -92,6 +92,12 @@ class Portfolio(TickerGroup, FundamentalMixin):
 
     def calculate_correlation(self):
         super().calculate_correlation()
+
+        if self.efficient_frontier is None:
+            self.portfolio_betas = {f: np.nan for f in self.full_symbols}
+            self.calculate_portfolio_beta()
+            return
+
         valid_mask = np.array([f in self.valid_full_symbols for f in self.full_symbols])
         # 1st calculate the portfolio weights discarding all the non valid covariance tickers (Todo its dangerous to say its real)
         weights = self.weights[valid_mask]
@@ -316,7 +322,7 @@ class Portfolio(TickerGroup, FundamentalMixin):
         """Aggregate financial time series across all holdings for plot_me."""
         if hasattr(self, '_plot_data_cache'):
             return self._plot_data_cache
-        series = {k: [] for k in ("bv", "eps", "revenue_ps", "operating_cf", "free_cf", "prices")}
+        series = {k: [] for k in ("bv", "cash_ps", "eps", "revenue_ps", "operating_cf", "free_cf", "prices")}
         price_dfs = []
 
         for sym, mkt, qty in zip(self.symbols, self.markets, self.quantities):
@@ -357,6 +363,7 @@ class Portfolio(TickerGroup, FundamentalMixin):
         self._plot_data_cache = {
             "times": times,
             "bv": np.array(agg["bv"]),
+            "cash_ps": np.array(agg["cash_ps"]),
             "eps": np.array(agg["eps"]),
             "revenue_ps": np.array(agg["revenue_ps"]),
             "operating_cf": np.array(agg["operating_cf"]),
@@ -404,7 +411,7 @@ class PortfolioGui(QWidget):
         if show_frontier:
             fig_frontier, (ax_ef, ax_capm) = plt.subplots(2, 1, figsize=(8, 10))
             portfolio.plot_portfolio(ax=ax_ef)
-            growth_mode = "Past Growth" if portfolio.use_past_growth else "DCF Forecast"
+            growth_mode = "Past Growth" if portfolio.forecast_policy == "past" else "DCF Forecast"
             ax_ef.set_ylabel("Expected Return (%s)" % growth_mode)
             ax_ef.grid(True)
             
@@ -548,7 +555,7 @@ class PortfolioGui(QWidget):
         self._builder_dialog = PortfolioBuilderDialog(
             ticker_data,
             existing_tickers=p.tickers_dictionary,
-            use_past_growth=p.use_past_growth,
+            forecast_policy=p.forecast_policy,
             amounts=amounts,
             parent=self
         )
@@ -642,7 +649,7 @@ class PortfolioGui(QWidget):
                 out_symbols, out_markets, out_quantities,
                 risk_free_rate=p.risk_free_rate,
                 existing_tickers=p.tickers_dictionary,
-                use_past_growth=p.use_past_growth
+                forecast_policy=p.forecast_policy
             )
             optimal_portfolio.calculate_correlation()
 
@@ -669,7 +676,8 @@ if __name__ == '__main__':
     apply_stylesheet(app, theme='dark_red.xml')
 
     portfolio = Portfolio(["msft", "aapl", "nvda", "googl", "brk.b"], 
-                          ["nasdaq", "nasdaq", "nasdaq", "nasdaq", "nyse"], [10, 5, 3, 4, 2])
+                          ["nasdaq", "nasdaq", "nasdaq", "nasdaq", "nyse"], [10, 5, 3, 4, 2],
+                          forecast_policy="past")
     portfolio.calculate_correlation()
     gui = PortfolioGui(portfolio, show_frontier=True)
     gui.show()

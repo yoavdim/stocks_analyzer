@@ -150,6 +150,7 @@ class YahooGroup:
         self.markets = markets
         self.history = None
         self.full_symbols = list()
+        self.valid_full_symbols = None
 
         yahoo_full_symbols = []
         tase_tickers = {}

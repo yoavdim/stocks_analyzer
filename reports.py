@@ -65,6 +65,7 @@ fields = {
         "Current Debt",
         "Long Term Debt",
         "Total Equity",
+        "Cash and Equivalents",
         "Goodwill and Other Intangible Assets",
         "Ordinary Shares Outstanding",
        # "Currency Code"

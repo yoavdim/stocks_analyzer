@@ -39,6 +39,18 @@ cache_file_name = "{symbol}-{market}.pkl"
 forcast_growth_field = PORTFOLIO_CONFIG["forecast_growth_field"]
 
 
+# Forecast policies for the efficient-frontier expected return of each ticker.
+# id -> human-readable label (used by the portfolio_analyzer startup dialog).
+# Non-stocks (indices/ETFs) always use past growth regardless of policy.
+FORECAST_POLICIES = {
+    "past":                  "Past growth",
+    "irr_past_if_nan":       "IRR (past if NaN)",
+    "irr_past_if_no_model":  "IRR (past if no model)",
+    "irr_filter_if_nan":     "IRR (filter if NaN)",
+    "irr_filter_if_no_model":"IRR (filter if no model)",
+}
+
+
 # --- DCF model persistence ---
 _DCF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dcf_models")
 
@@ -79,6 +91,24 @@ def compute_avg_fcf(plot_data: dict, basis: str) -> tuple[float, float]:
     n = len(annual)
     midpoint_offset = (n - 1) / 2
     return np.mean(annual), midpoint_offset
+
+
+def resolve_add_value(plot_data: dict, add_mode: str) -> float:
+    """Resolve the per-unit balance-sheet amount to add to a DCF intrinsic value.
+
+    add_mode: "none" -> 0, "book_value" -> latest BV/unit, "cash" -> latest cash/unit.
+    Returns 0.0 for "none" or when the underlying series is missing/NaN.
+    """
+    if add_mode in (None, "none"):
+        return 0.0
+    key = {"book_value": "bv", "cash": "cash_ps"}.get(add_mode)
+    if key is None:
+        raise ValueError(f"Unknown add_mode: {add_mode}")
+    series = plot_data.get(key)
+    if series is None or len(series) == 0:
+        return 0.0
+    value = series[-1]
+    return 0.0 if (value is None or np.isnan(value)) else float(value)
 
 
 class MarketDataCache:
@@ -235,8 +265,7 @@ def _linear_search(npv_function, price, min_growth, max_growth, delta_growth):
     return irr
 
 
-def build_dcf_model(average_annual_free_cash_flow, book_value, diluted_shares, growth, last_annual_date,
-                    add_bv=NPV_ASSUMPTIONS["add_book_value"],
+def build_dcf_model(average_annual_free_cash_flow, add_value, diluted_shares, growth, last_annual_date,
                     forward_to_present=NPV_ASSUMPTIONS["forward_to_present"],
                     short_term_is_linear=NPV_ASSUMPTIONS["short_term_is_linear"],
                     long_term_growth_duration=NPV_ASSUMPTIONS["long_term_growth_duration"],
@@ -248,7 +277,8 @@ def build_dcf_model(average_annual_free_cash_flow, book_value, diluted_shares, g
     Parameters
     ----------
     average_annual_free_cash_flow : float — average annual free cash flow
-    book_value : float — book value per unit (per-share for Ticker, total for Portfolio)
+    add_value : float — a last-report balance-sheet amount added to intrinsic value per
+        unit (e.g. book value per share, or cash per share). Pass 0 for none.
     diluted_shares : float — number of units to divide by (shares for Ticker, 1 for Portfolio)
     growth : float — short-term growth. Interpretation depends on short_term_is_linear:
         - False: percent compounding rate (e.g. 10 means 10%/yr)
@@ -294,7 +324,7 @@ def build_dcf_model(average_annual_free_cash_flow, book_value, diluted_shares, g
             elif long_term_q <= -1:
                 sum_discounted_fcf_long_term = np.nan
             else:
-                sum_discounted_fcf_long_term = first_long_term / (discount_rate - forcasted_long_term_growth_rate)
+                sum_discounted_fcf_long_term = first_long_term / (1 - long_term_q)
         else:  # (a1-an*q)/(1-q)
             last_long_term_times_q = last_short_term * long_term_q ** (long_term_growth_duration + 1)
             if long_term_q == 1:  # discontinuity point
@@ -303,8 +333,7 @@ def build_dcf_model(average_annual_free_cash_flow, book_value, diluted_shares, g
                 sum_discounted_fcf_long_term = (first_long_term - last_long_term_times_q) / (1 - long_term_q)
 
         intrinsic_value_dcf = (sum_discounted_fcf_short_term + sum_discounted_fcf_long_term) / diluted_shares
-        if add_bv:
-            intrinsic_value_dcf += book_value
+        intrinsic_value_dcf += add_value
         if forward_to_present:
             years = FundamentalMixin._calculate_time_forward(last_annual_date)
             intrinsic_value_dcf *= (discount_rate + 1) ** years
@@ -367,18 +396,19 @@ class FundamentalMixin:
             return np.nan
         return self.get_current_price() / forecasted_eps
 
-    def _build_dcf_from_plot_data(self, growth=None, avg_fcf=None, **kwargs):
+    def _build_dcf_from_plot_data(self, growth=None, avg_fcf=None, add_mode=None, **kwargs):
         """Build a DCF model from _get_plot_data. Returns (calc_npv, price) or (None, None).
         If a saved DCF model exists and no explicit parameters are passed, uses saved parameters.
         `growth` interpretation matches build_dcf_model: percent in exponential mode,
-        absolute FCF/share/yr in linear mode (kwargs['short_term_is_linear'])."""
+        absolute FCF/share/yr in linear mode (kwargs['short_term_is_linear']).
+        `add_mode` in {"none","book_value","cash"} — balance-sheet amount added post-roll."""
         data = self._get_plot_data()
         if data is None:
             return None, None
 
         # Apply saved DCF model only when no explicit parameters are passed.
         # Callers with explicit args (e.g. linear IRR, NPV calculator) bypass this.
-        if growth is None and avg_fcf is None and not kwargs:
+        if growth is None and avg_fcf is None and add_mode is None and not kwargs:
             model = getattr(self, 'dcf_model', None)
             if model:
                 remaining_years = dcf_remaining_growth_years(model)
@@ -396,9 +426,9 @@ class FundamentalMixin:
                         avg_fcf += growth * fcf_offset
                     else:
                         avg_fcf *= (1 + growth / 100) ** fcf_offset
+                add_mode = model["add_mode"]
                 kwargs = {
                     "short_term_is_linear": is_linear,
-                    "add_bv": model["add_book_value"],
                     "short_term_growth_duration": remaining_years,
                     "long_term_growth_duration": 0 if model["terminal_model"] == "Nothing" else -1,
                     "maximal_long_term_growth_rate": model["terminal_growth_percent"] / 100 if model["terminal_model"] == "Slow Exponent" else 0,
@@ -416,7 +446,7 @@ class FundamentalMixin:
 
         calc_npv = build_dcf_model(
             average_annual_free_cash_flow=avg_fcf,
-            book_value=data["bv"][-1] if len(data["bv"]) > 0 else 0,
+            add_value=resolve_add_value(data, add_mode),
             diluted_shares=1,
             growth=gr,
             last_annual_date=data["times"][-1] if data["times"] else datetime.datetime.now(),
@@ -454,10 +484,6 @@ class FundamentalMixin:
                 calc_npv, price = self._build_dcf_from_plot_data()
                 # Monotone if FCF positive (exponential growth preserves sign)
                 is_monotone = avg_fcf > 0
-            if calc_npv is None:
-                return np.nan
-            return search_growth(calc_npv, price, min_growth=NPV_ASSUMPTIONS["irr_search_min"],
-                                 monotone=is_monotone)
             if calc_npv is None:
                 return np.nan
             return search_growth(calc_npv, price, min_growth=NPV_ASSUMPTIONS["irr_search_min"],
@@ -665,6 +691,9 @@ class Ticker(FundamentalMixin):
         shares_outstanding = last_quarterly_income_statement["Diluted Weighted Average Shares"]  # Diluted
         statistics["book_value"] = total_equity / shares_outstanding
         statistics["shares (diluted)"] = shares_outstanding
+
+        # cash & equivalents per share (for the equity-DCF cash add-back; no debt subtraction)
+        statistics["cash_per_share"] = last_quarterly_balance_sheet.get("Cash and Equivalents", float('nan')) / shares_outstanding
 
         # dividends. Negate the "Common Stock Dividends Paid" field since it indicates lost money for the company
         # take the non-diluted number of shares since only real stocks receives dividends
@@ -1120,6 +1149,12 @@ class Ticker(FundamentalMixin):
                                                           "Diluted Weighted Average Shares", add_ttm=add_ttm))
         bv = equity / shares
 
+        try:
+            cash = np.array(self.reports.get_field_as_list("balance_sheet", "annual", "Cash and Equivalents", add_ttm=add_ttm))
+            cash_ps = cash / shares
+        except Exception:
+            cash_ps = np.full_like(bv, np.nan)
+
         earnings = np.array(self.reports.get_field_as_list("income_statement", "annual", "Net Income", add_ttm=add_ttm))
         eps = earnings / shares
 
@@ -1144,6 +1179,7 @@ class Ticker(FundamentalMixin):
         self._plot_data_cache = {
             "times": times,
             "bv": bv,
+            "cash_ps": cash_ps,
             "eps": eps,
             "revenue_ps": revenue_ps,
             "operating_cf": operating,
@@ -1244,7 +1280,7 @@ def format_axis(ax):
 """ --- Portfolios: --- """
 class TickerGroup(YahooGroup):
     def __init__(self, symbols:list, markets:list, *,
-                 risk_free_rate=None, existing_tickers:dict = dict(), use_past_growth=False):
+                 risk_free_rate=None, existing_tickers:dict = dict(), forecast_policy):
         symbols = [s.upper() for s in symbols]
         markets = [m.upper() for m in markets]
         super().__init__(symbols, markets)
@@ -1252,7 +1288,9 @@ class TickerGroup(YahooGroup):
         self.market_std = market_data.get_market_std()
         self.portfolio_std = np.nan
         self.tickers_dictionary = existing_tickers  # dict[(symbol,market)] will hold the ticker, will be used for get_forcasted_monthly_growth(), otherwise use past growth
-        self.use_past_growth = use_past_growth
+        if forecast_policy not in FORECAST_POLICIES:
+            raise ValueError(f"Unknown forecast_policy: {forecast_policy}")
+        self.forecast_policy = forecast_policy
         self.annual_growth_forecasts = list()
         self.beta_dictionary = {}
         self.efficient_frontier = None
@@ -1278,17 +1316,43 @@ class TickerGroup(YahooGroup):
         return pd.DataFrame.from_dict(d, orient='index', columns=columns)
 
     def calculate_correlation(self):
-        super().calculate_correlation()
+        # Note: we call get_monthly_prices() directly rather than super().calculate_correlation()
+        # So cov is computed only over the final valid set
+        self.get_monthly_prices()
         self.calculate_growth_forecast()
         self.build_beta_dictionary()
+        if len(self.valid_full_symbols) < 2:
+            print(f"Warning: only {len(self.valid_full_symbols)} valid ticker(s) after forecast policy '{self.forecast_policy}'; skipping efficient frontier")
+            self.efficient_frontier = None
+            return
+        # ef:
+        self.get_cov()
         self.create_frontier()
         self.find_tangency_portfolio()
         self.find_min_variance_portfolio()
 
     def calculate_growth_forecast(self):
+        """Compute the per-ticker expected annual return used by the efficient frontier,
+        according to self.forecast_policy. Tickers are always (re)created so their
+        statistics are computed/cached; the policy only affects the EF expected-return
+        input (and thus valid_full_symbols membership).
+
+        Policy decomposition:
+          - "past": always past performance.
+          - "irr_*": use the DCF/IRR forecast; when unavailable, either fall back to
+            past growth ("*_past_*") or drop the ticker from the frontier ("*_filter_*").
+          - unavailable = IRR is NaN ("*_if_nan"), or (no saved DCF model OR IRR NaN)
+            for the "*_if_no_model" variants.
+        Non-stocks (indices/ETFs) always use past growth.
+        """
         print("recreating tickers and calculating growth")  # todo optimize runtime
+        policy = self.forecast_policy
+        use_irr = policy != "past"
+        is_filter = policy in ("irr_filter_if_nan", "irr_filter_if_no_model")
+        require_model = policy in ("irr_past_if_no_model", "irr_filter_if_no_model")
+
         for symbol, market, full_symbol in zip(self.symbols, self.markets, self.full_symbols):
-            # For indices/ETFs, use past growth and skip ticker creation
+            # For indices/ETFs, always use past growth and skip ticker creation
             if not is_stock(self.yf_ticker.tickers[full_symbol]):
                 self.annual_growth_forecasts.append(self.get_past_annual_performance(symbol, market))
                 continue
@@ -1299,16 +1363,26 @@ class TickerGroup(YahooGroup):
                     self.tickers_dictionary[(symbol, market)] = Ticker.get_cache(symbol, market, yf_ticker=self.yf_ticker.tickers[full_symbol])
                 except Exception as e:
                     print(f"Warning: failed to create ticker for {symbol}:{market}: {e}")
-                    if not self.use_past_growth:
-                        self.annual_growth_forecasts.append(float('nan'))
-                        continue
-            
-            # Calculate growth: forecasted or past
-            if self.use_past_growth:
+
+            ticker = self.tickers_dictionary.get((symbol, market))
+
+            if not use_irr:  # "past"
+                self.annual_growth_forecasts.append(self.get_past_annual_performance(symbol, market))
+                continue
+
+            # IRR-based policies -----------------------------------------------
+            raw_irr = ticker.statistics.get("irr[%]") if ticker else None
+            has_model = bool(ticker and getattr(ticker, "dcf_model", None))
+            irr_nan = raw_irr is None or (isinstance(raw_irr, float) and np.isnan(raw_irr))
+            unavailable = irr_nan or (require_model and not has_model)
+
+            if not unavailable:
+                growth = ticker.get_forecasted_annual_growth()
+            elif is_filter:
+                growth = float('nan')  # dropped from the frontier below
+            else:  # past-fallback variants
                 growth = self.get_past_annual_performance(symbol, market)
-            else:
-                growth = self.tickers_dictionary[(symbol, market)].get_forecasted_annual_growth()
-            
+
             self.annual_growth_forecasts.append(growth)
 
         # Remove symbols with NaN forecasts from valid set
@@ -1352,6 +1426,8 @@ class TickerGroup(YahooGroup):
 
     def _solve_portfolio(self, ef_method, **kwargs):
         """Solve an efficient frontier optimization and return (weights, return, std, beta)."""
+        if self.efficient_frontier is None:
+            raise ValueError("no efficient frontier (too few valid tickers)")
         ef_copy = self.efficient_frontier.deepcopy()
         weights = ef_method(ef_copy, **kwargs)
         ret, std, _ = ef_copy.portfolio_performance(risk_free_rate=self.risk_free_rate)
@@ -1392,6 +1468,10 @@ class TickerGroup(YahooGroup):
     def plot_frontier(self, ax=None):
         if not ax:
             _, ax = plt.subplots()
+        if self.efficient_frontier is None:
+            ax.text(0.5, 0.5, "No efficient frontier\n(too few valid tickers for this forecast policy)",
+                    ha='center', va='center', transform=ax.transAxes)
+            return ax
         plotting.plot_efficient_frontier(self.efficient_frontier.deepcopy(), ax=ax, ef_param="return", show_assets=True, show_tickers=True)
         
         # Normalize X axis by market std

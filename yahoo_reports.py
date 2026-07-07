@@ -16,6 +16,7 @@ report_yahoo2msn = {
         "Current Debt" : "Current Debt",  # not all stocks have
         "Long Term Debt" : "Long Term Debt",
         "Common Stock Equity" : "Total Equity",
+        "Cash And Cash Equivalents" : "Cash and Equivalents",
         "Goodwill And Other Intangible Assets" : "Goodwill and Other Intangible Assets",
         "Ordinary Shares Number" : "Ordinary Shares Outstanding",
         #"???" : "Currency Code"

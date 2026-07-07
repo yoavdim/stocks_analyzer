@@ -42,8 +42,8 @@ class PortfolioBuilderDialog(QDialog):
         Available tickers to choose from.
     existing_tickers : dict, optional
         Dict of (symbol, market) -> Ticker objects to reuse.
-    use_past_growth : bool
-        Passed through to Portfolio constructor.
+    forecast_policy : str
+        Passed through to Portfolio constructor (EF expected-return source).
     parent : QWidget, optional
     """
 
@@ -54,13 +54,13 @@ class PortfolioBuilderDialog(QDialog):
     COL_AMOUNT = 4
     COL_MARKET_CAP = 5
 
-    def __init__(self, ticker_data, existing_tickers=None, use_past_growth=True, amounts=None, parent=None):
+    def __init__(self, ticker_data, existing_tickers=None, forecast_policy=None, amounts=None, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Build Portfolio")
         self.setMinimumSize(500, 400)
         self._ticker_data = ticker_data
         self._existing_tickers = existing_tickers or {}
-        self._use_past_growth = use_past_growth
+        self._forecast_policy = forecast_policy
         self._portfolio_windows = []
         has_amounts = amounts is not None
 
@@ -316,12 +316,17 @@ class PortfolioBuilderDialog(QDialog):
         selected_keys = set(zip(symbols, markets))
         filtered_tickers = {k: v for k, v in self._existing_tickers.items() if k in selected_keys}
 
+        # Inherit the originating portfolio's policy if given, else the session's cached choice
+        if self._forecast_policy is None:
+            from gui.forecast_policy_dialog import get_forecast_policy
+            self._forecast_policy = get_forecast_policy()
+
         try:
             from portfolio import Portfolio, PortfolioGui
             portfolio = Portfolio(
                 symbols, markets, amounts,
                 existing_tickers=filtered_tickers,
-                use_past_growth=self._use_past_growth
+                forecast_policy=self._forecast_policy
             )
             portfolio.calculate_correlation()
 

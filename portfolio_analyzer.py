@@ -4,6 +4,7 @@ from matplotlib import pyplot as plt
 from fx_converter import fx_converter
 from yfinance_info import YahooInfo
 from ticker import TickerGroup, search_growth, Ticker, PORTFOLIO_CONFIG
+from gui.forecast_policy_dialog import ask_forecast_policy
 from portfolio import Portfolio, PortfolioGui
 from datetime import datetime, timedelta
 import numpy as np
@@ -67,7 +68,7 @@ def get_buy_amount(df):
     return buy_amount
 
 
-def create_portfolio(table):
+def create_portfolio(table, forecast_policy="past"):
     # remove repetitions:
     symbols = []
     markets = []
@@ -85,7 +86,7 @@ def create_portfolio(table):
             markets.append(market)
             ids.append((symbol, market))
             amounts.append(buy_amount)
-    return Portfolio(symbols, markets, amounts, use_past_growth=PORTFOLIO_CONFIG["use_past_growth"])
+    return Portfolio(symbols, markets, amounts, forecast_policy=forecast_policy)
 
 
 def get_get_npv(table):  # will return the lambda function
@@ -194,10 +195,12 @@ def main():
     if not file:
         sys.exit(0)
 
+    forecast_policy = ask_forecast_policy(PORTFOLIO_CONFIG.get("forecast_policy", "past"))
+
     run_portfolio_optimization = True
 
     table = read_tsv(file)
-    portfolio = create_portfolio(table)
+    portfolio = create_portfolio(table, forecast_policy=forecast_policy)
 
     do_historic_analysis = "Date" in table.columns
     if do_historic_analysis:

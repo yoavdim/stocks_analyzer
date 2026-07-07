@@ -246,7 +246,10 @@ def group_tickers(tickers:list, filter_non_healthy:bool) -> TickerGroup:
             markets.append(ticker.market)
             existing_tickers[(ticker.symbol, ticker.market)] = ticker
     
-    ticker_group = TickerGroup(symbols, markets, existing_tickers=existing_tickers)
+    from gui.forecast_policy_dialog import ask_forecast_policy
+    forecast_policy = ask_forecast_policy()
+    ticker_group = TickerGroup(symbols, markets, existing_tickers=existing_tickers,
+                               forecast_policy=forecast_policy)
     return ticker_group
 
 

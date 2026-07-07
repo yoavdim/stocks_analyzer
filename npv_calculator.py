@@ -135,10 +135,19 @@ class GrowthApp(QWidget):
         capm_lbl.setStyleSheet("font-size: 11px; color: gray;")
         self.controls_layout.addWidget(capm_lbl)
 
-        # Add BV checkbox
-        self.add_bv_checkbox = QCheckBox("Add Book Value")
-        self.add_bv_checkbox.setChecked(True)
-        self.controls_layout.addWidget(self.add_bv_checkbox)
+        # Add balance-sheet value: None / Book Value / Cash (per share, shown inline)
+        try:
+            data = self.ticker._get_plot_data()
+            bv_ps = data["bv"][-1] if data and len(data["bv"]) else float('nan')
+            cash_ps = data["cash_ps"][-1] if data and len(data.get("cash_ps", [])) else float('nan')
+            currency = fx_converter.base_currency
+            add_names = ["None",
+                         f"BV ({bv_ps:.2f} {currency})",
+                         f"Cash ({cash_ps:.2f} {currency})"]
+        except Exception:
+            add_names = ["None", "BV", "Cash"]
+        self.add_group = self._init_radio(prefix="Add:", names=add_names, horizontal=True)
+        self.add_group.buttons()[0].setChecked(True)  # None default
 
         # Result label
         self.result_label = QLabel("")
@@ -205,8 +214,13 @@ class GrowthApp(QWidget):
         # Discount rate
         self.discount_rate_input.setText(str(model.get("discount_rate_percent", 10.0)))
 
-        # Add book value
-        self.add_bv_checkbox.setChecked(model.get("add_book_value", True))
+        # Add mode (None / Book Value / Cash)
+        add_mode = model["add_mode"]
+        add_label = {"none": "None", "book_value": "BV", "cash": "Cash"}[add_mode]
+        for btn in self.add_group.buttons():
+            if btn.text().split(" (")[0] == add_label:
+                btn.setChecked(True)
+                break
 
         # FCF basis
         fcf_basis = model.get("fcf_basis", "4-year avg")
@@ -284,6 +298,11 @@ class GrowthApp(QWidget):
         text = self.fcf_basis_group.checkedButton().text()
         return text.split(" (")[0]
 
+    def _get_add_mode(self) -> str:
+        """Return the balance-sheet add mode: 'none' | 'book_value' | 'cash'."""
+        label = self.add_group.checkedButton().text().split(" (")[0]
+        return {"None": "none", "BV": "book_value", "Cash": "cash"}[label]
+
     def _resolve_growth(self, benchmark, is_linear):
         """Return (growth_rate_percent, linear_growth_per_share_per_year) for the chosen benchmark.
         - growth_rate_percent: compounding rate in % (always meaningful, used for exp mode)
@@ -336,7 +355,7 @@ class GrowthApp(QWidget):
         args_iir = {
             "forward_to_present": True,
             "growth": growth,
-            "add_bv": self.add_bv_checkbox.isChecked(),
+            "add_mode": self._get_add_mode(),
             "short_term_is_linear": is_linear,
             "long_term_growth_duration": 0 if self.perpetuity_group.checkedButton().text() == "Nothing" else -1,
             "short_term_growth_duration": int(self.growth_time_input.text()),
@@ -354,7 +373,7 @@ class GrowthApp(QWidget):
             growth=growth,
             avg_fcf=avg_fcf,
             short_term_is_linear=is_linear,
-            add_bv=args_iir["add_bv"],
+            add_mode=args_iir["add_mode"],
             long_term_growth_duration=args_iir["long_term_growth_duration"],
             short_term_growth_duration=args_iir["short_term_growth_duration"],
             maximal_long_term_growth_rate=args_iir["maximal_long_term_growth_rate"],
@@ -396,7 +415,7 @@ class GrowthApp(QWidget):
             terminal_growth_percent=float(self.perpetuity_growth_input.text()),
             terminal_model=self.perpetuity_group.checkedButton().text(),
             discount_rate_percent=float(self.discount_rate_input.text()),
-            add_book_value=self.add_bv_checkbox.isChecked(),
+            add_mode=self._get_add_mode(),
             fcf_basis=self._get_fcf_basis(),
             last_report_date=str(stats.get("updated at", "")),
         )
