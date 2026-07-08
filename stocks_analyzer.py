@@ -45,6 +45,7 @@ class tickerWorkerStatus():
     def setFailure(self, msg):
         self.status = self.STATUS_FAILED
         self.msg = msg
+        self.ticker = None  # never ship a failed (possibly unpicklable) ticker back
 
     def setTicker(self, ticker):
         self.ticker = ticker
@@ -69,46 +70,33 @@ class tickerWorkerStatus():
 
 # TODO: replace all silly prints with proper log functions that indicate an
 #   error
-def create_ticker_worker(ticker_queue_tuple):
+def create_ticker_worker(ticker_tuple):
+    """Build one ticker and RETURN its status (consumed via pool.imap_unordered).
+    Never raises: all failures are captured in the returned status object."""
     warnings.simplefilter('error')  # scoped to this worker process only
 
-    # the multiproccesing will hide any uncatched exception, so wrapping the whole function in a general try statement
+    symbol, market = ticker_tuple
+    status = tickerWorkerStatus(symbol, market)
+
     try:
-        symbol, market = ticker_queue_tuple["ticker_tuple"]
-        status_queue = ticker_queue_tuple["queue"]
+        ticker = Ticker.get_cache(symbol, market)
 
-        status = tickerWorkerStatus(symbol, market)
+        if ticker.warnings:
+            status.setWarning("Ticker {}:{} has warnings: {}".format(symbol, market, ", ".join(ticker.warnings)))
 
-        try:
-            # print("Fetching data for {symbol}:{market}\n".format(symbol = symbol,
-                # market = market))
-            ticker = Ticker.get_cache(symbol, market)
-
-            if ticker.warnings:
-                status.setWarning("Ticker {}:{} has warnings: {}".format(symbol, market, ", ".join(ticker.warnings)))
-
-            status.setTicker(ticker)
-        except YfinanceException as err:
-            status.setFailure("Failed in yfinance. error: {}".format(err))
-        except MsnReportsException as err:
-            status.setFailure("Failed in reports. error: {}".format(err))
-        except StatisticsException as err:
-            status.setFailure("Failed in statistics. error: {}".format(err))
-        except Exception as err:
-            status.setFailure("Failed in an unknown location. error: {}".format(err))
-
-        #todo if inner fields are needed, call post_pickle at the other side
-        if status.ticker:
-            status.ticker.pre_pickle(short_term=True)
-
-        try:
-            status_queue.put(status)
-        except Exception as err:
-            print(f"Inserting the ticker {symbol}:{market} object into the queue failed.")
-            print("This probably means that some of its objects cannot be serialized")
-            print("")
+        status.setTicker(ticker)
+        # prepare for pickling inside the try so a serialization-prep 
+        ticker.pre_pickle(short_term=True)
+    except YfinanceException as err:
+        status.setFailure("Failed in yfinance. error: {}".format(err))
+    except MsnReportsException as err:
+        status.setFailure("Failed in reports. error: {}".format(err))
+    except StatisticsException as err:
+        status.setFailure("Failed in statistics. error: {}".format(err))
     except Exception as err:
-        print(Fore.RED + "ERROR: " + Fore.RESET + str(err))
+        status.setFailure("Failed in an unknown location. error: {}".format(err))
+
+    return status
 
 
 def create_tickers_from_symbol_names(symbol_list):
@@ -125,32 +113,27 @@ def create_tickers_from_symbol_names(symbol_list):
     LONGEST_PROGRESS_STRING = len("99.99% [{} / {}]".format(symbols_nr, symbols_nr)) +\
                               len(Fore.CYAN) * 6
 
-    manager = mp.Manager()
-    queue   = manager.Queue(len(symbol_list))
-    ticker_queue_tuple = [ { "ticker_tuple" : ticker, "queue" : queue }
-            for ticker in symbol_list ]
-
     tickers_list = list()
     with mp.Pool(processes=None) as pool:
-        result = pool.map_async(create_ticker_worker, ticker_queue_tuple)
-        while not result.ready():
-            while not queue.empty():
-                status_item = queue.get()
-                if not status_item.isFailed():
-                    tickers_list.append(status_item.getTicker())
+        # imap_unordered yields each result as soon as any worker finishes
+        # (completion order) over the pool's native pipe - no Manager proxy,
+        # no busy-poll RPCs - while still allowing incremental progress output.
+        for status_item in pool.imap_unordered(create_ticker_worker, symbol_list):
+            if not status_item.isFailed():
+                tickers_list.append(status_item.getTicker())
 
-                symbol_ix = symbol_ix + 1
-                percent = round((symbol_ix / symbols_nr) * 100, 2)
+            symbol_ix = symbol_ix + 1
+            percent = round((symbol_ix / symbols_nr) * 100, 2)
 
-                # create the progress string (multiline to add it color)
-                progress = Fore.CYAN + f"{percent}%" + Fore.RESET
-                progress = progress + " [" + Fore.MAGENTA + str(symbol_ix) + Fore.RESET
-                progress = progress + " / " + Fore.MAGENTA + str(symbols_nr) + Fore.RESET
-                progress = progress + "]"
+            # create the progress string (multiline to add it color)
+            progress = Fore.CYAN + f"{percent}%" + Fore.RESET
+            progress = progress + " [" + Fore.MAGENTA + str(symbol_ix) + Fore.RESET
+            progress = progress + " / " + Fore.MAGENTA + str(symbols_nr) + Fore.RESET
+            progress = progress + "]"
 
-                progress = progress.ljust(LONGEST_PROGRESS_STRING)
+            progress = progress.ljust(LONGEST_PROGRESS_STRING)
 
-                print(progress, status_item)
+            print(progress, status_item)
 
     return tickers_list
 
