@@ -60,10 +60,13 @@ def get_ticker_from_standard_symbols(symbol:str, market:str):
 class YahooInfo:
 
     def get_stock_price_now(self):
-        """Get the current stock price in USD, or, if the market is closed, the closing price,
-        without caching, as the price continue to change"""
-        todays_data = self.yf_ticker.history(period='5d')
-        return todays_data['Close'].dropna().iloc[-1]
+        """Get the current stock price in USD, or, if the market is closed, the
+        closing price. Cached for the lifetime of this object (one fetch per
+        session); not pickled, so a new process refetches a fresh price."""
+        if getattr(self, "_price_now", None) is None:
+            todays_data = self.yf_ticker.history(period='5d')
+            self._price_now = todays_data['Close'].dropna().iloc[-1]
+        return self._price_now
 
     def get_stock_price_at_date(self, day, month, year):
         """Get the stock price in USD at the given date, or the closest after it if the
@@ -123,9 +126,13 @@ class YahooInfo:
 
     def pre_pickle(self):
         self.yf_ticker = None
+        self._price_now = None  # don't persist a live price into the cache
 
     def post_pickle(self, yf_ticker=None):
         self.yf_ticker = yf_ticker if yf_ticker else YfTickerUSD(self.full_symbol)
+        # seed currencies from the pickled info so the fresh wrapper doesn't
+        # re-fetch .info just to detect currency
+        self.yf_ticker.set_currencies(self.info.get("currency"), self.info.get("financialCurrency"))
 
     def __init__(self, symbol, market, *, yf_info = None):
         self.full_symbol, self.market_endian = get_ticker_from_standard_symbols(symbol, market)
@@ -138,6 +145,7 @@ class YahooInfo:
         try:
             self.info = self.yf_ticker.info
             self.stock_prices = dict()
+            self._price_now = None  # lifetime cache for get_stock_price_now
         except:
             raise YfinanceException("Failed to create yf symbol {} or fetch its info".format(self.full_symbol))
 

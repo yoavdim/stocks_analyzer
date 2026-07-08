@@ -79,6 +79,12 @@ class TaseTickerUSD:
             _check_staleness(self._cache, self.fund_id)
         return self._cache
 
+    def set_currencies(self, price_currency=None, financial_currency=None):
+        for c in (price_currency, financial_currency):
+            if c and c.upper() not in ("ILA", "ILS"):
+                raise ValueError(f"TaseTickerUSD expects ILA/ILS, got {c}")
+        # currencies are fixed (ILA); nothing to set
+
     def _detect_currencies(self):
         pass  # currencies are fixed
 

@@ -196,6 +196,12 @@ class YfTickerUSD:
         self._price_currency = None
         self._financial_currency = None
 
+    def set_currencies(self, price_currency, financial_currency=None):
+        """Pre-set currencies (e.g. from cache) to skip the .info fetch in _detect_currencies."""
+        if price_currency:
+            self._price_currency = price_currency.upper()
+            self._financial_currency = (financial_currency or price_currency).upper()
+
     def _detect_currencies(self):
         """Lazily detect currencies on first access that needs them."""
         if self._price_currency is not None:
