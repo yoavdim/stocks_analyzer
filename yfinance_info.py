@@ -18,6 +18,29 @@ with open(_config_path, "r") as _f:
 # is consistent (the app behaves as if frozen in time) instead of resampling.
 NOW_DATE = datetime.date.today()
 
+# Only these .info keys are kept when pickling a ticker. The full .info dict has
+# ~180 keys (incl. long company description/officer blobs) which bloat and slow the cache.
+# This keeps the fields the code reads plus useful analyst/financial extras for
+# potential future features.
+_INFO_KEEP_KEYS = {
+    # required by the code (currency detection, statistics, is_stock, market cap)
+    "currency", "financialCurrency", "shortName", "sector", "industry",
+    "beta", "quoteType", "marketCap",
+    # useful extras kept for future use / inspection
+    "longName", "corporateActions",
+    "trailingPE", "forwardPE", "trailingEps", "forwardEps",
+    "recommendationKey", "targetMeanPrice",
+    "fiftyTwoWeekHigh", "fiftyTwoWeekLow",
+    "sharesOutstanding", "floatShares", "impliedSharesOutstanding",
+    "earningsGrowth", "revenueGrowth", "profitMargins",
+    "returnOnEquity", "debtToEquity",
+    # dividends / splits
+    "dividendRate", "dividendYield", "exDividendDate", "dividendDate", "payoutRatio",
+    "lastDividendValue", "lastDividendDate",
+    "trailingAnnualDividendRate", "trailingAnnualDividendYield", "fiveYearAvgDividendYield",
+    "lastSplitFactor", "lastSplitDate",
+}
+
 
 class YfinanceException(Exception):
     """Exceptions that are thrown from the yfinance class. The class is
@@ -159,7 +182,9 @@ class YahooInfo:
         else:
             self.yf_ticker = YfTickerUSD(self.full_symbol)
         try:
-            self.info = self.yf_ticker.info
+            # keep only the whitelisted .info keys (from ~180 originally) to
+            # shrink and speed up the pickle; done once at fetch time
+            self.info = {k: v for k, v in self.yf_ticker.info.items() if k in _INFO_KEEP_KEYS}
             self.stock_prices = dict()
             self._price_now = None  # lifetime cache for get_stock_price_now
             # full-range daily price series  - stripped during pickle.
