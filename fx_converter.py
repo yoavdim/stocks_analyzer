@@ -254,19 +254,27 @@ class YfTickerUSD:
 
         return df
 
+    @staticmethod
+    def _is_monetary_row(row_label) -> bool:
+        """A statement row is monetary unless it's shares, ratios, per-share, etc."""
+        return not any(kw in str(row_label).lower() for kw in _NON_MONETARY_KEYWORDS)
+
     def _convert_financial_df(self, df: pd.DataFrame) -> pd.DataFrame:
         """Convert a financial statement DataFrame to base currency.
         Skips non-monetary rows (shares, ratios, etc.)."""
         self._detect_currencies()
         if df is None or df.empty or self._financial_currency == _BASE_CURRENCY:
             return df
+
+        # each column is a statement date, so it gets its own FX rate
+        rate_per_date = pd.Series(
+            {date: fx_converter.get_rate_at(self._financial_currency, date)
+             for date in df.columns}
+        )
+        monetary_rows = [self._is_monetary_row(row) for row in df.index]
+
         df = df.copy()
-        for col in df.columns:
-            rate = fx_converter.get_rate_at(self._financial_currency, col)
-            for row_label in df.index:
-                if any(kw in row_label.lower() for kw in _NON_MONETARY_KEYWORDS):
-                    continue
-                df.at[row_label, col] = df.at[row_label, col] * rate
+        df.loc[monetary_rows] = df.loc[monetary_rows].mul(rate_per_date, axis=1)
         return df
 
     @property
