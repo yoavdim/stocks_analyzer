@@ -149,6 +149,8 @@ def get_index(table):
     idx = YahooInfo(index_yahoo_name, index_market)
     table = table.copy()
     dates = pd.to_datetime(table["Date"], format=frmt)
+    # one bulk fetch covering all transaction dates -> now
+    idx.prefetch_price_range(dates.min().date())
     idx_prices = [idx.get_stock_price_at_date(date.day, date.month, date.year) for date in dates]
     adjusted_amount = table["Amount"] * table["Cost"] / idx_prices
     table["Cost"] = idx_prices

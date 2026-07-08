@@ -134,7 +134,7 @@ class MarketDataCache:
         def fetch():
             spx = YahooInfo("%5EGSPC", "NASDAQ")
             d = datetime.date.today() - datetime.timedelta(days=365)
-            old = spx.get_stock_price_at_date(d.day, d.month, d.year)
+            old = spx.fetch_price_at_date_uncached(d.day, d.month, d.year)
             return (spx.get_stock_price_now() - old) / old
         return self._get("mkt", fetch)
 
@@ -664,6 +664,10 @@ class Ticker(FundamentalMixin):
 
         yahoo_info = self.yahoo_info
 
+        # one bulk price fetch covering every date this computation will look up
+        # (first report date -> today)
+        self.yahoo_info.prefetch_price_range(min(annual_dates).date())
+
         statistics["price on update"] = self.yahoo_info.get_stock_price_at_date(annual_dates[-1].day,
                                                                                 annual_dates[-1].month,
                                                                                 annual_dates[-1].year)
@@ -995,12 +999,12 @@ class Ticker(FundamentalMixin):
             return Ticker(symbol, market, yf_info=yf_ticker)
 
 
-    def pre_pickle(self):
-        self.reports.pre_pickle()
-        self.yahoo_info.pre_pickle()
+    def pre_pickle(self, short_term):
+        self.reports.pre_pickle(short_term)
+        self.yahoo_info.pre_pickle(short_term)
 
-    def post_pickle(self, yf_ticker=None):
-        self.yahoo_info.post_pickle(yf_ticker)
+    def post_pickle(self, yf_ticker=None, price_now=None):
+        self.yahoo_info.post_pickle(yf_ticker, price_now)
         self.reports.post_pickle(self.yahoo_info.yf_ticker)
         self.dcf_model = load_dcf_model(self.symbol, self.market)
         return self
@@ -1012,9 +1016,10 @@ class Ticker(FundamentalMixin):
             os.makedirs(tickers_dir, exist_ok=True)
             with open(cache_file, 'wb') as file:
                 yf_ticker = self.yahoo_info.yf_ticker
-                self.pre_pickle()
+                price_now = self.yahoo_info._price_now
+                self.pre_pickle(short_term=False)
                 pickle.dump(self, file)
-                self.post_pickle(yf_ticker)
+                self.post_pickle(yf_ticker, price_now)
                 
             
         except TypeError:
@@ -1118,19 +1123,24 @@ class Ticker(FundamentalMixin):
         dates = self.reports.get_reports_dates(term, add_ttm)
         start_date = dates[0]
         end_date = dates[-1]
-        date_vector, price_vector = self.yahoo_info.get_stock_price_in_range(start_date, end_date, interval="1d")
+        date_vector, price_vector = self.yahoo_info.get_stock_price_in_range(start_date, end_date)
         return date_vector, price_vector
 
     def get_price_graph_after_report(self, term, add_ttm=False):
         dates = self.reports.get_reports_dates(term, add_ttm)
         start_date = dates[-1]
         end_date = datetime.datetime.now()
-        date_vector, price_vector = self.yahoo_info.get_stock_price_in_range(start_date, end_date, interval="1d")
+        date_vector, price_vector = self.yahoo_info.get_stock_price_in_range(start_date, end_date)
         return date_vector, price_vector
 
     def get_price_at_report_dates(self, term, add_ttm=False):
         reports_ordered = self.reports.get_reports_ascending(term, 'balance_sheet', add_ttm)
         dates = [report["Period End Date"] for report in reports_ordered]
+        # one bulk fetch covering all report dates -> today, so each date below
+        # is served from memory instead of its own windowed network request
+        if dates:
+            earliest = min(datetime.date(d["year"], d["month"], d["day"]) for d in dates)
+            self.yahoo_info.prefetch_price_range(earliest)
         prices = [self.yahoo_info.get_stock_price_at_date(date["day"], date["month"], date["year"]) for date in dates]
         return prices
 

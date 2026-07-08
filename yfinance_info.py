@@ -14,6 +14,10 @@ _config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "npv_con
 with open(_config_path, "r") as _f:
     _PORTFOLIO_CONFIG = json.load(_f).get("portfolio", {})
 
+# "Now" is decided once at app start and held fixed, so every price fetch/slice
+# is consistent (the app behaves as if frozen in time) instead of resampling.
+NOW_DATE = datetime.date.today()
+
 
 class YfinanceException(Exception):
     """Exceptions that are thrown from the yfinance class. The class is
@@ -68,68 +72,80 @@ class YahooInfo:
             self._price_now = todays_data['Close'].dropna().iloc[-1]
         return self._price_now
 
-    def get_stock_price_at_date(self, day, month, year):
-        """Get the stock price in USD at the given date, or the closest after it if the
-        market was closed on that date. @date is a dictionary of keys day, month
-        and year"""
+    def prefetch_price_range(self, from_date):
+        """Fetch the daily Close series [from_date, now] ONCE into a transient
+        in-memory cache (_range_series). Every price lookup (per-date and graph
+        slices) is served from this single fetch. Not pickled.
 
-        # Use zfill to make 6 appear as 06. This would make it compatible with
-        # the format in the cache file
+        The range always runs to today, so its last point is the current price;
+        it is pinned to the frozen _price_now (decided once) so the app stays
+        consistent even as the market keeps moving."""
+        if getattr(self, "_range_series", None) is not None:
+            return  # already fetched this session (first report date -> now)
+        if isinstance(from_date, datetime.datetime):
+            from_date = from_date.date()
+
+        close = self.yf_ticker.history(start=from_date, end=NOW_DATE + datetime.timedelta(days=1))["Close"].dropna()
+        self._range_series = close
+        
+        if getattr(self, "_price_now", None) is None:
+            # first observation of 'now' -> freeze it from the range's last close
+            self._price_now = float(close.iloc[-1])
+        else:
+            # freeze in time: force the last point to the already-decided price
+            close.iloc[-1] = self._price_now
+
+    def get_stock_price_at_date(self, day, month, year):
+        """Stock price in USD at the given date (or the closest trading day
+        after it), served from the prefetched full-range series. Call
+        prefetch_price_range first; for a one-off lookup without a prefetched
+        range use fetch_price_at_date_uncached."""
         date_str = "{year}-{month}-{day}".format(day=str(day).zfill(2), month=str(month).zfill(2), year=year)
         if date_str in self.stock_prices:
             return self.stock_prices[date_str]
 
-        # We never fetched the stock for this date, we fetch the stock price
-        # from a day *after* the requested one because yahoo data (for some
-        # reason) returns the stock one day earlier than requested
-        date      = datetime.date(day=day, month=month, year=year) + datetime.timedelta(days=1)
-        next_date = date + datetime.timedelta(days=10)
-        
-        # return value is a pandas table in the form
-        #                  Open      High        Low      Close    Volume  Dividends  Stock Splits
-        # Date                                                                                    
-        # 2018-03-14  91.601436  91.88071  90.041359  90.378410  32132000          0             0
-        stocks_data = self.yf_ticker.history(start = date, end = next_date) #,debug = False)
+        series = getattr(self, "_range_series", None)
+        # nearest trading day >= target (bfill); NaN if target is past the range
+        price = series.reindex([pd.Timestamp(year=year, month=month, day=day)], method="bfill").iloc[0]
+        self.stock_prices[date_str] = price
+        return price
 
-        # to stock data at date. Cache and return 'NaN'
-        if not len(stocks_data):
-            self.stock_prices[date_str] = float('NaN')
-            return float('NaN')
+    def fetch_price_at_date_uncached(self, day, month, year):
+        """One-off uncached price lookup: does its own small windowed fetch and
+        does NOT touch the shared price cache or the prefetched range. Use for a
+        single past date when no range prefetch is warranted."""
+        # fetch from a day *after* the requested one because yahoo returns the
+        # stock one day earlier than requested
+        start = datetime.date(day=day, month=month, year=year) + datetime.timedelta(days=1)
+        stocks_data = self.yf_ticker.history(start=start, end=start + datetime.timedelta(days=10))
+        return stocks_data["Close"].iloc[0] if len(stocks_data) else float("nan")
 
-        for entry in range(len(stocks_data)):
-            stock = stocks_data.iloc[entry]
-            stock_date  = stock.name.strftime("%Y-%m-%d")
-            stock_price = stock["Close"]
-            self.stock_prices[stock_date] = stock_price
-
-        # In case the closest stock price to date is not the requested date in
-        # this function, make sure the requested date is cached as well.
-        # E.g. if the requested date is Saturday, no stock data would be
-        # available for this date
-        self.stock_prices[date_str] = stocks_data.iloc[0]["Close"]
-
-        # return the first value in the table which is the closest stock price
-        # to the requested date
-        return stocks_data.iloc[0]["Close"]
-
-    def get_stock_price_in_range(self, from_date, to_date, interval="1d"):
-        # in case any date isn't cached, fetch the entire date range and cache
+    def get_stock_price_in_range(self, from_date, to_date):
+        # Served from the shared daily range series (one fetch, first report
+        # date -> now). Returns only the requested [from_date, to_date] slice as
+        # (DatetimeIndex, Close Series), so the price graph and the per-date
+        # lookups all draw from a single network round-trip.
         # @return date & price vectors
-        # todo: this is only a dummy implementation without caching and without filling weekends
-        #   this is for testing the rest of the code
-        stocks_data = self.yf_ticker.history(start=from_date + datetime.timedelta(days=1),
-                                             end=to_date + datetime.timedelta(days=1),
-                                             interval=interval)
-        times = stocks_data.index
-        prices = stocks_data['Close']
-        return times, prices
+        self.prefetch_price_range(from_date)
+        series = self._range_series if self._range_series is not None else pd.Series(dtype=float)
+        sliced = series.loc[pd.Timestamp(from_date):pd.Timestamp(to_date)]
+        return sliced.index, sliced
 
-    def pre_pickle(self):
+    def pre_pickle(self, short_term):
         self.yf_ticker = None
-        self._price_now = None  # don't persist a live price into the cache
+        # transient full-range daily price series, only alive during a build.
+        # removing also in short term to save on memory for the entire ticker list TODO: this will cause a refetch in npv_calculator price plot
+        self._range_series = None
+        # a short-term pickle (e.g. across the process pool) keeps the freshly
+        # fetched price; the long-term disk cache must not persist a stale price
+        if not short_term:
+            self._price_now = None
 
-    def post_pickle(self, yf_ticker=None):
+    def post_pickle(self, yf_ticker=None, price_now=None):
         self.yf_ticker = yf_ticker if yf_ticker else YfTickerUSD(self.full_symbol)
+        # restore the live price the same way as yf_ticker (None if not provided)
+        self._price_now = price_now
+        self._range_series = None  # transient, never persisted
         # seed currencies from the pickled info so the fresh wrapper doesn't
         # re-fetch .info just to detect currency
         self.yf_ticker.set_currencies(self.info.get("currency"), self.info.get("financialCurrency"))
@@ -146,6 +162,8 @@ class YahooInfo:
             self.info = self.yf_ticker.info
             self.stock_prices = dict()
             self._price_now = None  # lifetime cache for get_stock_price_now
+            # full-range daily price series  - stripped during pickle.
+            self._range_series = None
         except:
             raise YfinanceException("Failed to create yf symbol {} or fetch its info".format(self.full_symbol))
 
@@ -269,7 +287,7 @@ if __name__ == '__main__':  # test index
     fig = plt.figure()
     end_date = datetime.datetime.now()
     start_date = end_date - datetime.timedelta(days=(365.25*4))
-    date_vector, price_vector = y.get_stock_price_in_range(start_date, end_date, interval="1d")
+    date_vector, price_vector = y.get_stock_price_in_range(start_date, end_date)
     plt.plot(date_vector, price_vector, '-')
     plt.show()
 

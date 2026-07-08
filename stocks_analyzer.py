@@ -99,7 +99,7 @@ def create_ticker_worker(ticker_queue_tuple):
 
         #todo if inner fields are needed, call post_pickle at the other side
         if status.ticker:
-            status.ticker.pre_pickle()
+            status.ticker.pre_pickle(short_term=True)
 
         try:
             status_queue.put(status)

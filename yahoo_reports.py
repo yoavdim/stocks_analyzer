@@ -57,7 +57,7 @@ class YReports(BaseReport):
         self.parse_and_save_reports()
         self.finish_init()
 
-    def pre_pickle(self):
+    def pre_pickle(self, short_term):
         self.yf_ticker = None
 
     def post_pickle(self, yf_ticker = None):

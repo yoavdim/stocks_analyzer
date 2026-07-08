@@ -149,6 +149,12 @@ class BaseReport:
         self.get_ttm("income_statement")
         self.get_ttm("cash_flow")
 
+    def pre_pickle(self, short_term):
+        pass  # no live state to drop
+
+    def post_pickle(self, *args, **kwargs):
+        pass  # subclasses restore live refs (e.g. yf_ticker)
+
     def _ffill_diluted_shares(self):
         """Forward-fill 'Diluted Weighted Average Shares' across quarterly income statements."""
         import numpy as np
