@@ -8,7 +8,10 @@ import pandas as pd
 import warnings
 import sys
 from time import sleep
-from os.path import basename
+from os.path import basename, join
+import os
+
+OUTPUT_DIR = "outputs"
 
 import multiprocessing as mp
 
@@ -292,8 +295,10 @@ def main():
     risk_free_rate = NPV_ASSUMPTIONS["portfolio_risk_free_rate_percent"] / 100
     my_stocks_file = select_stocks_file()
 
-    csv_path  = ".".join(basename(my_stocks_file).split(".")[:-1]) + "_statistics.csv"
-    tldr_path = ".".join(basename(my_stocks_file).split(".")[:-1]) + "_statistics_tldr.csv"
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    stem = ".".join(basename(my_stocks_file).split(".")[:-1])
+    csv_path  = join(OUTPUT_DIR, stem + "_statistics.csv")
+    tldr_path = join(OUTPUT_DIR, stem + "_statistics_tldr.csv")
     try:  # alert the user while still have time
         with open(csv_path, 'a+'):
             pass

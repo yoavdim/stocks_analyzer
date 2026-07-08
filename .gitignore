@@ -28,3 +28,9 @@ inputs/my_stocks.txt
 
 # DCF models (user-specific)
 dcf_models/
+
+# Profiling scripts & generated reports
+profiling/
+
+# Generated output CSVs 
+outputs/*

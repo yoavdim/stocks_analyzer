@@ -133,8 +133,10 @@ class tickers_gui(QWidget):
         self.tickers_table.horizontalHeader().setSortIndicatorShown(True)
 
     def _export_csv(self):
+        os.makedirs(stocks_analyzer.OUTPUT_DIR, exist_ok=True)
+        default_path = os.path.join(os.getcwd(), stocks_analyzer.OUTPUT_DIR, "statistics.csv")
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export CSV", os.path.join(os.getcwd(), "statistics.csv"),
+            self, "Export CSV", default_path,
             "CSV Files (*.csv)"
         )
         if not path:
