@@ -70,6 +70,16 @@ market_to_yf_market = {
         "ASX"       : "AX",  # Australia
     }
 
+# Best-effort trading currency per market, used to pre-warm the FX cache before
+# the worker pool forks (so each currency's history is fetched once, not once
+# per worker). The authoritative currency still comes from each ticker's .info
+market_to_currency = {
+        "NASDAQ": "USD", "NYSE": "USD", "AMEX": "USD",
+        "TPE": "TWD", "TYO": "JPY", "LON": "GBX",  # LSE quotes in pence
+        "SWX": "CHF", "AMS": "EUR", "STO": "SEK", "TLV": "ILA",  # TASE in agora
+        "KRX": "KRW", "SHE": "CNY", "TSE": "CAD", "ASX": "AUD",
+    }
+
 def get_ticker_from_standard_symbols(symbol:str, market:str):
     full_symbol = symbol.replace('.', '-').replace(' ', '-')  # for tickers like "brk.b"
 

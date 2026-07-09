@@ -146,30 +146,61 @@ class FxConverter:
             return self.get_rate(currency)
         return rate / divisor
 
+    def prefetch_currencies(self, currencies):
+        """Warm the FX history cache for the given currencies. Call once in the
+        parent process before forking workers, so each currency's 10y history is
+        fetched a single time and inherited by every worker (instead of being
+        re-fetched per worker).
+
+        Fetches run concurrently (I/O-bound) via a thread pool. Best-effort:
+        failures are swallowed by _get_fx_history."""
+        # distinct non-base lookup currencies to fetch
+        lookups = set()
+        for currency in currencies:
+            if not currency:
+                continue
+            lookup, _ = self._resolve_sub_unit(currency)
+            if lookup != self.base_currency:
+                lookups.add(lookup)
+        lookups = list(lookups)  # fix order so results line up with currencies
+        if not lookups:
+            return
+
+        # Only the (I/O-bound) web fetch is parallelized; each thread computes
+        # its own currency's Series and touches no shared state. Cache insertion
+        # happens here in the main thread, avoiding races on _history_cache.
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=len(lookups)) as pool:
+            results = pool.map(self._compute_fx_history, lookups)
+        for currency, hist in zip(lookups, results):
+            self._history_cache[currency] = hist
+
+    def _compute_fx_history(self, currency: str) -> pd.Series:
+        """Fetch 10y daily FX history for a standard currency -> base_currency and
+        return the Series. Pure: performs no cache access, so it is safe to run
+        concurrently. Returns an empty Series on failure."""
+        try:
+            if self.base_currency == "USD":
+                return self._fetch_pair_history(f"{currency}USD=X")
+            hist_to_usd = self._fetch_pair_history(f"{currency}USD=X")
+            hist_usd_to_base = self._fetch_pair_history(f"USD{self.base_currency}=X")
+            # Align and multiply
+            common_idx = hist_to_usd.index.union(hist_usd_to_base.index)
+            hist_to_usd = hist_to_usd.reindex(common_idx, method="ffill")
+            hist_usd_to_base = hist_usd_to_base.reindex(common_idx, method="ffill")
+            return (hist_to_usd * hist_usd_to_base).dropna()
+        except Exception as e:
+            print(f"FX WARNING: failed to get history for {currency}->{self.base_currency}, prices will not be converted: {e}")
+            return pd.Series(dtype=float)
+
     def _get_fx_history(self, currency: str) -> pd.Series:
         """Fetch and cache 10y daily FX history for a standard currency -> base_currency."""
         cached = self._history_cache.get(currency)
         if cached is not None:
             return cached
-
-        try:
-            if self.base_currency == "USD":
-                hist = self._fetch_pair_history(f"{currency}USD=X")
-            else:
-                hist_to_usd = self._fetch_pair_history(f"{currency}USD=X")
-                hist_usd_to_base = self._fetch_pair_history(f"USD{self.base_currency}=X")
-                # Align and multiply
-                common_idx = hist_to_usd.index.union(hist_usd_to_base.index)
-                hist_to_usd = hist_to_usd.reindex(common_idx, method="ffill")
-                hist_usd_to_base = hist_usd_to_base.reindex(common_idx, method="ffill")
-                hist = (hist_to_usd * hist_usd_to_base).dropna()
-
-            self._history_cache[currency] = hist
-            return hist
-        except Exception as e:
-            print(f"FX WARNING: failed to get history for {currency}->{self.base_currency}, prices will not be converted: {e}")
-            self._history_cache[currency] = pd.Series(dtype=float)
-            return self._history_cache[currency]
+        hist = self._compute_fx_history(currency)
+        self._history_cache[currency] = hist
+        return hist
 
     @staticmethod
     def _fetch_pair_history(pair: str) -> pd.Series:

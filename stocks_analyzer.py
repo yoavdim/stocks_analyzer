@@ -120,6 +120,13 @@ def create_tickers_from_symbol_names(symbol_list):
     market_data.get_risk_free_rate()
     market_data.get_market_return()
 
+    # pre-warm FX history for the currencies these markets trade in, so each
+    # currency is fetched once here and inherited by all forked workers 
+    from fx_converter import fx_converter
+    from yfinance_info import market_to_currency
+    currencies = {market_to_currency.get(market.upper()) for _, market in symbol_list}
+    fx_converter.prefetch_currencies(currencies)
+
     symbols_nr = len(symbol_list)
     symbol_ix   = 0
     LONGEST_PROGRESS_STRING = len("99.99% [{} / {}]".format(symbols_nr, symbols_nr)) +\
